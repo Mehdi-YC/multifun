@@ -28,9 +28,9 @@ describe('protocol', () => {
 	});
 
 	it('validates username format on profile.save', () => {
-		expect(requestPayloads['profile.save'].safeParse({ username: 'Cool_Player' }).success).toBe(
-			true
-		);
+		const ok = requestPayloads['profile.save'].safeParse({ username: 'Cool_Player' });
+		expect(ok.success).toBe(true);
+		if (ok.success) expect(ok.data.username).toBe('cool_player');
 		expect(requestPayloads['profile.save'].safeParse({ username: 'no spaces' }).success).toBe(false);
 		expect(requestPayloads['profile.save'].safeParse({ username: 'ab' }).success).toBe(false);
 	});

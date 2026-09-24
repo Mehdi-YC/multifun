@@ -159,7 +159,13 @@ export const requestPayloads = {
 	}),
 	'profile.get': z.object({ username: z.string().optional() }),
 	'profile.save': z.object({
-		username: z.string().min(3).max(20).regex(/^[a-z0-9_]+$/).optional(),
+		username: z
+			.string()
+			.min(3)
+			.max(20)
+			.regex(/^[a-zA-Z0-9_]+$/)
+			.transform((s) => s.toLowerCase())
+			.optional(),
 		displayName: z.string().min(1).max(24).optional(),
 		bio: z.string().max(200).optional(),
 		avatarJson: avatarConfigSchema.optional()

@@ -6,7 +6,9 @@ import { getRequestEvent } from '$app/server';
 import { db } from '$lib/server/db';
 
 export const auth = betterAuth({
-	baseURL: env.ORIGIN,
+	// Empty ORIGIN => infer from the request, so any dev port works.
+	// Set ORIGIN explicitly in production.
+	baseURL: env.ORIGIN || undefined,
 	secret: env.BETTER_AUTH_SECRET,
 	database: drizzleAdapter(db, { provider: 'sqlite' }),
 	emailAndPassword: { enabled: true },
