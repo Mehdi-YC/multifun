@@ -36,6 +36,7 @@ export type GameEvent =
 	| { kind: 'collect'; player: PlayerId; item: string }
 	| { kind: 'hit'; player: PlayerId; by: PlayerId; force: number }
 	| { kind: 'boost'; player: PlayerId; power: number }
+	| { kind: 'transform'; player: PlayerId; mode: 'cube' | 'ship' | 'ball' }
 	| { kind: 'lap'; player: PlayerId; lap: number; timeMs: number }
 	| { kind: 'countdown'; value: number }
 	| { kind: 'match-end' };

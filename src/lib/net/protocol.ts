@@ -22,6 +22,11 @@ export const gameEventSchema: z.ZodType<GameEvent> = z.lazy(() =>
 		}),
 		z.object({ kind: z.literal('boost'), player: z.string(), power: z.number() }),
 		z.object({
+			kind: z.literal('transform'),
+			player: z.string(),
+			mode: z.enum(['cube', 'ship', 'ball'])
+		}),
+		z.object({
 			kind: z.literal('lap'),
 			player: z.string(),
 			lap: z.number(),
