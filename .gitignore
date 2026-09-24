@@ -28,3 +28,7 @@ test-results
 storybook-static
 # SQLite
 *.db
+
+# SQLite WAL side-files
+*.db-shm
+*.db-wal

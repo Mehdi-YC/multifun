@@ -36,7 +36,7 @@ import {
 	requestPayloads,
 	type LobbySnapshot
 } from '$lib/net/protocol';
-import type { MatchResult, SimPlayer } from '$lib/game/types';
+import type { GameConfig, MatchResult, SimPlayer } from '$lib/game/types';
 
 const HEARTBEAT_MS = 10_000;
 const CONNECTION_TIMEOUT_MS = 30_000;
@@ -355,7 +355,12 @@ export class RealtimeServer {
 			slot: i
 		}));
 		const seed = randomSeed();
-		const config = gameConfigs[lobby.gameId];
+		// lobby settings (host-configurable) override the game defaults
+		const base = gameConfigs[lobby.gameId];
+		const config: GameConfig = {
+			...base,
+			options: { ...base.options, ...lobby.settings }
+		};
 		const sim = createServerSim(lobby.gameId, seed, config, players);
 		const matchId = await createMatch({
 			lobbyId: lobby.id,

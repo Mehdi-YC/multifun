@@ -12,9 +12,12 @@ lobbies, and play three multiplayer games together:
 
 | Working title     | Genre                          | Inspiration             | Priority |
 | ----------------- | ------------------------------ | ----------------------- | -------- |
-| **GeoDash Party** | Multiplayer Geometry Dash-like | Geometry Dash           | 1st game |
-| **Turbo Kart**    | Top-down kart racer            | Super Mario Kart (SNES) | 2nd      |
-| **Pixel Brawl**   | Platform fighter               | Brawlhalla / Smash      | 3rd      |
+| **Pixel Tanks**   | Top-down tank arena battle     | Battle City / Combat    | 1st game |
+| **GeoDash Party** | Multiplayer Geometry Dash-like | Geometry Dash           | 2nd      |
+| **Turbo Kart**    | Top-down kart racer            | Super Mario Kart (SNES) | 3rd      |
+| **Pixel Brawl**   | Platform fighter               | Brawlhalla / Smash      | 4th      |
+
+(Echo Arena — the platform's netcode test chamber — stays playable alongside them.)
 
 Guiding principles:
 
@@ -588,3 +591,9 @@ Notes from building Phase 0 (keep updated per milestone):
   that only lobby/game pages connected, leaving the landing page "offline". WS upgrades are
   auth-gated, so logged-out visitors legitimately have no connection — the nav dot is hidden for
   them instead of showing a scary "offline".
+- **Pivot (user): tanks first.** "Pixel Tanks" (top-down arena: obstacles, 2 lives each, level ups)
+  jumped ahead of GeoDash on the roadmap. Both games now build as `GameModule`s and the platform
+  wires them via `sim-registry` + `GAME_META`; host lobby `settings` are merged into the match
+  `config.options` (e.g. `levelId`, `arenaId`).
+- **GameEvent/`GameId` growth:** new games extend the `GameId` union — every `Record<GameId, …>`
+  (registry, meta, limits, configs, UI maps) must gain a key or `svelte-check` flags it.

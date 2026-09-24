@@ -4,13 +4,14 @@
  */
 import type { GameId, GameModule } from '../types';
 import { echoModule } from './echo';
+import { geodashModule } from '../geodash';
 
 export * from './echo';
 
 export const gameModules: Record<GameId, GameModule | undefined> = {
 	echo: echoModule,
 	tank: undefined, // wired when the tank module lands
-	geodash: undefined,
+	geodash: geodashModule,
 	kart: undefined,
 	brawl: undefined
 };

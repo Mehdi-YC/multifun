@@ -31,8 +31,8 @@ export const GAME_META: Record<GameId, GameMeta> = {
 		title: 'GeoDash Party',
 		tagline: 'Race friends through impossible spike-filled levels.',
 		accent: 'var(--color-geodash)',
-		players: '2-8 players',
-		status: 'coming'
+		players: '1-8 players',
+		status: 'playable'
 	},
 	kart: {
 		id: 'kart',
