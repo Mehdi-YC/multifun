@@ -11,6 +11,7 @@
 
 	const HOW_TO: Record<GameId, string> = {
 		echo: 'Move your square, race for distance before time runs out.',
+		tank: 'Drive with WASD/arrows, shoot with Space. 2 lives — last tank standing wins.',
 		geodash: 'Jump and flip over the spikes — first to the portal takes the crown.',
 		kart: 'Drift the corners, grab boosts and blast past your rivals.',
 		brawl: 'Smash opponents off the stage — last pixel standing wins.'
