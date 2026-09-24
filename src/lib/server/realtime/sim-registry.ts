@@ -5,13 +5,15 @@
 import type { GameConfig, GameId, GameSim, SimPlayer } from '$lib/game/types';
 import { createEchoSim } from '$lib/game/modules/echo/sim';
 import { createGeodashSim } from '$lib/game/geodash/sim';
+import { createTankSim } from '$lib/game/tank/sim';
 
 type SimFactory = (seed: number, config: GameConfig, players: SimPlayer[]) => GameSim;
 
 const factories: Partial<Record<GameId, SimFactory>> = {
 	echo: createEchoSim,
-	geodash: createGeodashSim
-	// tank lands with the tank module; kart / brawl later
+	geodash: createGeodashSim,
+	tank: createTankSim
+	// kart / brawl land in later phases
 };
 
 export const gameLimits: Record<GameId, { minPlayers: number; maxPlayers: number }> = {

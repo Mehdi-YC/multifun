@@ -39,7 +39,7 @@ type Stream = Map<PlayerId, InputFrame>[];
 
 function inputMap(keys: Partial<Record<PlayerId, number>>): Map<PlayerId, InputFrame> {
 	const map = new Map<PlayerId, InputFrame>();
-	for (const [id, mask] of Object.entries(keys)) map.set(id, { keys: mask });
+	for (const [id, mask] of Object.entries(keys)) map.set(id, { keys: mask ?? 0 });
 	return map;
 }
 

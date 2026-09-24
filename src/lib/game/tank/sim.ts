@@ -26,7 +26,7 @@ import type {
 	PlayerId,
 	SimPlayer
 } from '../types';
-import { EMPTY_INPUT, KEY } from '../types';
+import { KEY } from '../types';
 import { clamp } from '../engine/fixed';
 import {
 	TILE_SIZE,

@@ -13,15 +13,15 @@ import type {
 	InputFrame,
 	PlayerId,
 	SimPlayer
-} from '../../types';
-import { AudioManager } from '../../engine/audio';
-import { PixelCanvas, type CanvasSourceLike } from '../../engine/gfx';
-import { InputManager } from '../../engine/input';
-import { FixedTimestepLoop } from '../../engine/loop';
-import { Camera } from '../../engine/camera';
-import { ParticleSystem } from '../../engine/particles';
-import { nowMs } from '../../engine/fixed';
-import { mulberry32 } from '../../engine/rng';
+} from '../types';
+import { AudioManager } from '../engine/audio';
+import { PixelCanvas, type CanvasSourceLike } from '../engine/gfx';
+import { InputManager } from '../engine/input';
+import { FixedTimestepLoop } from '../engine/loop';
+import { Camera } from '../engine/camera';
+import { ParticleSystem } from '../engine/particles';
+import { nowMs } from '../engine/fixed';
+import { mulberry32 } from '../engine/rng';
 import { TILE_SIZE, tileAt } from './arena';
 import {
 	BULLET_LIFE,
