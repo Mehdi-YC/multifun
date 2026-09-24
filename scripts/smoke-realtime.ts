@@ -151,8 +151,9 @@ async function main(): Promise<void> {
 		`results=${JSON.stringify((gameEnd.d?.results ?? []).map((r) => [r.placement, r.score]))}`
 	);
 
-	await wire.req('lobby.leave', { lobbyId: lobbyState.id });
-	log('lobby.leave');
+	// host deletes the lobby at the end — cleans up after the test itself
+	await wire.req('lobby.delete', { lobbyId: lobbyState.id });
+	log('lobby.delete');
 	ws.close();
 	console.log('\nSMOKE OK — full realtime pipeline verified');
 	process.exit(0);

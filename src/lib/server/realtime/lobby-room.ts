@@ -189,6 +189,28 @@ export class LobbyRoom {
 		this.broadcastPresence();
 	}
 
+	/** Host-only: close the lobby for everyone and remove it from listings. */
+	async deleteLobby(conn: Connection): Promise<void> {
+		if (conn.userId !== this.snapshot.hostUserId) throw new Error('not-host');
+		if (this.matchRunning) throw new Error('match-running');
+		for (const m of this.snapshot.members) {
+			await leaveLobby(this.lobbyId, m.userId);
+		}
+		this.broadcast({
+			t: 'lobby.state',
+			d: { ...this.state(), status: 'closed', members: [] }
+		});
+		for (const other of [...this.conns.values()]) {
+			other.rooms.delete(this.lobbyId);
+			if (other.userId !== conn.userId) {
+				other.sendError('lobby-deleted', 'The host deleted this lobby');
+			}
+		}
+		this.conns.clear();
+		this.broadcastPresence();
+		await this.close();
+	}
+
 	async startGame(conn: Connection): Promise<void> {
 		if (conn.userId !== this.snapshot.hostUserId) throw new Error('not-host');
 		if (this.matchRunning) throw new Error('match-running');

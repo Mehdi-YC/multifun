@@ -97,6 +97,61 @@ test('two players: lobby by code, chat, ready, match with results', async ({ bro
 	await pageA.getByRole('button', { name: 'Back to lobby' }).click();
 	await expect(pageA.getByRole('button', { name: 'Ready up' })).toBeVisible();
 
+	// cleanup: host deletes the lobby so test runs don't pollute the lobby list
+	await pageA.getByRole('button', { name: 'Delete lobby' }).click();
+	await pageA.getByRole('button', { name: 'Delete', exact: true }).click();
+	await pageA.waitForURL(/\/play\/echo/);
+
+	await ctxA.close();
+	await ctxB.close();
+});
+
+test('rejoin after leaving or being kicked; host can delete the lobby', async ({ browser }) => {
+	const ctxA = await browser.newContext();
+	const ctxB = await browser.newContext();
+	const pageA = await ctxA.newPage();
+	const pageB = await ctxB.newPage();
+
+	await signUp(pageA, 'Host2', nextEmail());
+	await signUp(pageB, 'Guest2', nextEmail());
+
+	await pageA.goto('/play/echo');
+	await pageA.getByLabel('Lobby name').fill('Lifecycle Lobby');
+	await pageA.getByRole('button', { name: 'Create', exact: true }).click();
+	await pageA.waitForURL(/\/lobby\/[A-Z0-9]{6}/);
+	const code = pageA.url().split('/').pop()!;
+
+	const joinByCode = async (page: Page) => {
+		await page.goto('/play/echo');
+		// submit the join-by-code form via Enter — there are many "Join" buttons
+		// (one per listed lobby), only this input is unambiguous
+		await page.getByLabel('Lobby code').fill(code);
+		await page.getByLabel('Lobby code').press('Enter');
+		await page.waitForURL(new RegExp(`/lobby/${code}`));
+	};
+
+	// guest joins, leaves voluntarily, rejoins
+	await joinByCode(pageB);
+	await expect(pageB.getByText('Guest2').first()).toBeVisible();
+	await pageB.getByRole('button', { name: 'Leave lobby' }).click();
+	await pageB.waitForURL(/\/play\/echo/);
+	await joinByCode(pageB);
+	await expect(pageB.getByText('Guest2').first()).toBeVisible();
+
+	// host kicks the guest — guest can come back afterwards (regression)
+	await pageA.getByRole('button', { name: 'Remove Guest2 from the lobby' }).click();
+	await pageB.waitForURL(/\/play\/echo/);
+	await joinByCode(pageB);
+	await expect(pageB.getByText('Guest2').first()).toBeVisible();
+
+	// host deletes the lobby — guest is removed and the code is dead
+	await pageA.getByRole('button', { name: 'Delete lobby' }).click();
+	await pageA.getByRole('button', { name: 'Delete', exact: true }).click();
+	await pageA.waitForURL(/\/play\/echo/);
+	await pageB.waitForURL(/\/play\/echo/);
+	await pageB.goto(`/lobby/${code}`);
+	await expect(pageB.getByText(/not found|closed/i).first()).toBeVisible();
+
 	await ctxA.close();
 	await ctxB.close();
 });

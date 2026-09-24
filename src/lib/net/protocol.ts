@@ -49,7 +49,7 @@ export const avatarConfigSchema = z.object({
 });
 export type AvatarConfig = z.infer<typeof avatarConfigSchema>;
 
-export const gameIdSchema = z.enum(['echo', 'geodash', 'kart', 'brawl']);
+export const gameIdSchema = z.enum(['echo', 'tank', 'geodash', 'kart', 'brawl']);
 
 export const memberSnapshotSchema = z.object({
 	userId: z.string(),
@@ -146,6 +146,7 @@ export const requestPayloads = {
 	}),
 	'lobby.join': z.object({ code: z.string().min(4).max(8) }),
 	'lobby.leave': z.object({ lobbyId: z.string() }),
+	'lobby.delete': z.object({ lobbyId: z.string() }),
 	'lobby.list': z.object({ gameId: gameIdSchema.optional() }),
 	'lobby.ready': z.object({ lobbyId: z.string(), ready: z.boolean() }),
 	'lobby.start': z.object({ lobbyId: z.string() }),

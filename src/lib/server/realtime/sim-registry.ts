@@ -14,7 +14,8 @@ const factories: Partial<Record<GameId, SimFactory>> = {
 
 export const gameLimits: Record<GameId, { minPlayers: number; maxPlayers: number }> = {
 	echo: { minPlayers: 1, maxPlayers: 4 },
-	geodash: { minPlayers: 2, maxPlayers: 8 },
+	tank: { minPlayers: 2, maxPlayers: 8 },
+	geodash: { minPlayers: 1, maxPlayers: 8 },
 	kart: { minPlayers: 2, maxPlayers: 8 },
 	brawl: { minPlayers: 2, maxPlayers: 4 }
 };
@@ -22,6 +23,7 @@ export const gameLimits: Record<GameId, { minPlayers: number; maxPlayers: number
 /** Match configs per game (mirrors GameModule.defaults; kept node-safe here). */
 export const gameConfigs: Record<GameId, GameConfig> = {
 	echo: { tickRate: 60, durationTicks: 60 * 20, options: {} },
+	tank: { tickRate: 60, durationTicks: 60 * 120, options: { arenaId: 'crossfire' } },
 	geodash: { tickRate: 60, durationTicks: 60 * 90, options: { levelId: 'daily' } },
 	kart: { tickRate: 60, durationTicks: 60 * 120, options: { laps: 3 } },
 	brawl: { tickRate: 60, durationTicks: 60 * 180, options: { stocks: 3 } }

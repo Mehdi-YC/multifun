@@ -46,22 +46,20 @@ export async function joinLobby(
 	userId: string,
 	role: 'host' | 'player' = 'player'
 ): Promise<void> {
-	const members = await db
-		.select()
-		.from(lobbyMember)
-		.where(and(eq(lobbyMember.lobbyId, lobbyId), isNull(lobbyMember.leftAt)));
-	const existing = members.find((m) => m.userId === userId);
+	const all = await db.select().from(lobbyMember).where(eq(lobbyMember.lobbyId, lobbyId));
+	const active = all.filter((m) => m.leftAt === null);
+	const existing = all.find((m) => m.userId === userId);
 	if (existing) {
-		// Rejoin (page reload, reconnect): reclaim the slot but keep ready state —
-		// a refresh must never silently un-ready a player.
+		if (existing.leftAt === null) return; // already in (page refresh) — keep ready state
+		// genuine rejoin after leave/kick: reactivate the same slot, un-ready
 		await db
 			.update(lobbyMember)
-			.set({ leftAt: null })
+			.set({ leftAt: null, isReady: false })
 			.where(and(eq(lobbyMember.lobbyId, lobbyId), eq(lobbyMember.userId, userId)));
 		return;
 	}
-	if (members.length >= (await getMaxPlayers(lobbyId))) throw new Error('lobby-full');
-	const usedSlots = new Set(members.map((m) => m.slot));
+	if (active.length >= (await getMaxPlayers(lobbyId))) throw new Error('lobby-full');
+	const usedSlots = new Set(active.map((m) => m.slot));
 	let slot = 0;
 	while (usedSlots.has(slot)) slot++;
 	await db.insert(lobbyMember).values({ lobbyId, userId, slot, role });

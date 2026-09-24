@@ -268,6 +268,13 @@ export class RealtimeServer {
 				if (room) await room.leave(conn);
 				return { ok: true };
 			}
+			case 'lobby.delete': {
+				const p = requestPayloads['lobby.delete'].parse(payload);
+				const room = this.roomForConnection(conn, p.lobbyId);
+				if (!room) throw new Error('not-in-lobby');
+				await room.deleteLobby(conn);
+				return { ok: true };
+			}
 			case 'lobby.list': {
 				const p = requestPayloads['lobby.list'].parse(payload);
 				return { lobbies: await listPublicLobbies(p.gameId) };
@@ -428,6 +435,7 @@ function humanError(code: string): string {
 		'lobby-not-found': 'Lobby not found — check the code',
 		'lobby-full': 'That lobby is full',
 		'lobby-closed': 'That lobby is closed',
+		'lobby-deleted': 'The host deleted this lobby',
 		'match-in-progress': 'A match is already running — wait for it to end',
 		'not-host': 'Only the host can do that',
 		'not-everyone-ready': 'Everyone must be ready first',

@@ -3,8 +3,8 @@
  * Everything here must stay UI-framework-free and deterministic-friendly.
  */
 
-export type GameId = 'echo' | 'geodash' | 'kart' | 'brawl';
-export const GAME_IDS: GameId[] = ['echo', 'geodash', 'kart', 'brawl'];
+export type GameId = 'echo' | 'tank' | 'geodash' | 'kart' | 'brawl';
+export const GAME_IDS: GameId[] = ['echo', 'tank', 'geodash', 'kart', 'brawl'];
 
 export type PlayerId = string;
 

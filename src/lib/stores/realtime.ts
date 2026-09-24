@@ -75,6 +75,16 @@ export function realtime(): RealtimeClient {
 			matchResults.set({ matchId: msg.d.matchId, results: msg.d.results });
 		});
 		client.on('err', (msg) => {
+			// Membership was taken away — drop the lobby so auto-rejoin can't
+			// resurrect it and the lobby page can show its "you're out" state.
+			if (
+				msg.d.code === 'kicked' ||
+				msg.d.code === 'lobby-deleted' ||
+				msg.d.code === 'lobby-closed'
+			) {
+				lobby.set(null);
+				chat.set([]);
+			}
 			console.warn('[realtime]', msg.d.code, msg.d.msg);
 		});
 	}

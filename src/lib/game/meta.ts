@@ -18,6 +18,14 @@ export const GAME_META: Record<GameId, GameMeta> = {
 		players: '1-4 players',
 		status: 'playable'
 	},
+	tank: {
+		id: 'tank',
+		title: 'Pixel Tanks',
+		tagline: 'Arena tank battles — 2 lives each, obstacles, level ups.',
+		accent: 'var(--color-tank)',
+		players: '2-8 players',
+		status: 'playable'
+	},
 	geodash: {
 		id: 'geodash',
 		title: 'GeoDash Party',

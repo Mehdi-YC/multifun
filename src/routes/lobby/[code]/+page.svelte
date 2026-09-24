@@ -56,6 +56,7 @@
 	let settingsName = $state('');
 	let settingsMax = $state('4');
 	let settingsPublic = $state(true);
+	let deleteOpen = $state(false);
 
 	const room = $derived($lobby ?? data.lobby);
 	const gameMeta = $derived(GAME_META[room?.gameId ?? 'echo']);
@@ -75,6 +76,18 @@
 	const ranked = $derived(
 		[...($matchResults?.results ?? [])].sort((a, b) => a.placement - b.placement)
 	);
+
+	// Membership can be revoked at any time (kick / lobby deleted / lobby
+	// closed): the store drops the lobby (or just this member) when that
+	// happens, and the stale SSR snapshot must not resurrect the room.
+	let removed = false;
+
+	function handleRemoval(): void {
+		if (removed) return;
+		removed = true;
+		toast('You were removed from the lobby.', 'error');
+		void goto(resolve('/play/[gameId]', { gameId: gameMeta.id }));
+	}
 
 	onMount(() => {
 		// Seed chat from server history exactly once; the store appends live lines afterwards.
@@ -103,6 +116,21 @@
 								: 'Could not join this lobby — it may have closed.';
 				});
 		}
+
+		// Watch for the membership being revoked (kicked / lobby deleted /
+		// closed). The SSR snapshot still has the room, so only a live snapshot
+		// that drops it — or drops us from it — is proof. First load is safe:
+		// nothing counts as "seen" until this lobby appears in the store.
+		let sawLobby = false;
+		return lobby.subscribe((snap) => {
+			if (removed) return;
+			if (snap && target && snap.id === target.id) {
+				sawLobby = true;
+				if (!snap.members.some((m) => m.userId === data.selfUserId)) handleRemoval();
+			} else if (!snap && sawLobby) {
+				handleRemoval();
+			}
+		});
 	});
 
 	// keep chat pinned to the newest lines (store subscription, cleaned up on detach)
@@ -181,6 +209,25 @@
 		}
 	}
 
+	async function deleteLobby(event: SubmitEvent) {
+		event.preventDefault();
+		if (!room || busy) return;
+		busy = true;
+		// Deliberate teardown — the closing broadcast must not look like a kick.
+		removed = true;
+		try {
+			await realtime().request('lobby.delete', { lobbyId: room.id });
+			deleteOpen = false;
+			toast('Lobby deleted.', 'success');
+			void goto(resolve('/play/[gameId]', { gameId: gameMeta.id }));
+		} catch (err) {
+			removed = false;
+			requestToast(err, 'Could not delete the lobby.');
+		} finally {
+			busy = false;
+		}
+	}
+
 	async function kick(userId: string) {
 		if (!room) return;
 		try {
@@ -227,6 +274,7 @@
 	}
 
 	function leaveLobby() {
+		removed = true; // leaving on purpose — don't treat the store reset as a kick
 		leaveCurrentLobby();
 		void goto(resolve('/play/[gameId]', { gameId: gameMeta.id }));
 	}
@@ -362,6 +410,9 @@
 						START GAME
 					</PixelButton>
 					<PixelButton variant="secondary" onclick={openSettings}>Settings</PixelButton>
+					<PixelButton variant="danger" disabled={busy} onclick={() => (deleteOpen = true)}>
+						Delete lobby
+					</PixelButton>
 					{#if !allReady}
 						<span
 							class="font-pixel text-[8px] text-muted"
@@ -434,6 +485,19 @@
 		<div class="flex justify-end gap-2">
 			<PixelButton variant="ghost" onclick={() => (settingsOpen = false)}>Cancel</PixelButton>
 			<PixelButton type="submit">Save</PixelButton>
+		</div>
+	</form>
+</PixelModal>
+
+<!-- delete lobby confirm modal -->
+<PixelModal title="Delete this lobby?" bind:open={deleteOpen}>
+	<form class="flex flex-col gap-4" onsubmit={deleteLobby}>
+		<p class="font-body text-sm text-muted">
+			Everyone will be removed and the lobby closes for good.
+		</p>
+		<div class="flex justify-end gap-2">
+			<PixelButton variant="ghost" onclick={() => (deleteOpen = false)}>Cancel</PixelButton>
+			<PixelButton variant="danger" type="submit" disabled={busy}>Delete</PixelButton>
 		</div>
 	</form>
 </PixelModal>

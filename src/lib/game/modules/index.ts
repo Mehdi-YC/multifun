@@ -9,6 +9,7 @@ export * from './echo';
 
 export const gameModules: Record<GameId, GameModule | undefined> = {
 	echo: echoModule,
+	tank: undefined, // wired when the tank module lands
 	geodash: undefined,
 	kart: undefined,
 	brawl: undefined
