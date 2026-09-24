@@ -1,42 +1,46 @@
-# sv
+# MultiFun
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+A pixel-art multiplayer game platform: simple profiles, lobbies by join code, and three games
+racing to be fun.
 
-## Creating a project
+| Game            | Genre                          | Status      |
+| --------------- | ------------------------------ | ----------- |
+| **GeoDash Party** | Multiplayer Geometry Dash-like | In progress |
+| **Turbo Kart**    | Top-down kart racer            | Planned     |
+| **Pixel Brawl**   | Platform fighter               | Planned     |
 
-If you're seeing this, you've probably already done this step. Congrats!
+See [`plan.md`](./plan.md) for the full architecture, netcode design and milestone plan.
 
-```sh
-# create a new project
-npx sv create my-app
-```
+## Stack
 
-To recreate this project with the same configuration:
+SvelteKit (Svelte 5, runes) · TypeScript · Tailwind 4 · Canvas 2D game engine (in-repo) ·
+WebSockets (in-process realtime server) · Drizzle + SQLite · better-auth · Vitest + Playwright +
+Storybook · bun
 
-```sh
-# recreate this project
-bun x sv@0.17.1 create --template minimal --types ts --add prettier eslint vitest="usages:unit,component" playwright tailwindcss="plugins:typography,forms" drizzle="database:sqlite+sqlite:better-sqlite3" better-auth="demo:password" storybook ai-tools="ide:opencode" --install bun ./
-```
-
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
+## Develop
 
 ```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
+bun install
+bun run db:generate && bun run db:migrate   # first time / after schema changes
+bun run dev
 ```
 
-## Building
+- App: http://localhost:5173
+- Realtime: ws://localhost:5173/realtime (mounted on the same dev server)
+- Storybook: `bun run storybook`
 
-To create a production version of your app:
+## Test
 
 ```sh
-npm run build
+bun run test:unit     # vitest (node sims + browser components + storybook)
+bun run check         # svelte-check
+bun run lint          # prettier + eslint
+bun run test:e2e      # playwright
 ```
 
-You can preview the production build with `npm run preview`.
+## Production
 
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+```sh
+bun run build         # vite build + realtime bundle
+bun run start         # node server.js — web + websocket on one port
+```

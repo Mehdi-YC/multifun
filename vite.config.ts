@@ -3,8 +3,9 @@ import tailwindcss from '@tailwindcss/vite';
 
 import { defineConfig } from 'vitest/config';
 import { playwright } from '@vitest/browser-playwright';
-import adapter from '@sveltejs/adapter-auto';
+import adapter from '@sveltejs/adapter-node';
 import { sveltekit } from '@sveltejs/kit/vite';
+import { multifunRealtime } from './src/lib/server/realtime/vite-plugin.ts';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { storybookTest } from '@storybook/addon-vitest/vitest-plugin';
@@ -17,6 +18,7 @@ const dirname = typeof __dirname !== 'undefined'
 export default defineConfig({
   plugins: [
     tailwindcss(),
+    multifunRealtime(),
     sveltekit({
       compilerOptions: {
         // Force runes mode for the project, except for libraries. Can be removed in svelte 6.
