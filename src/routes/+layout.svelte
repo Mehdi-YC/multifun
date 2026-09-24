@@ -63,19 +63,21 @@
 			</nav>
 
 			<div class="flex items-center gap-3">
-				<span
-					class="inline-flex items-center gap-2 border-2 border-border px-2 py-1"
-					title="Realtime connection: {status.label}"
-				>
+				{#if data.user}
 					<span
-						class="inline-block h-2 w-2"
-						style:background-color={status.color}
-						style:animation={$connection === 'connecting'
-							? 'blink 900ms steps(2) infinite'
-							: undefined}
-					></span>
-					<span class="font-pixel text-[8px] text-muted">{status.label}</span>
-				</span>
+						class="inline-flex items-center gap-2 border-2 border-border px-2 py-1"
+						title="Realtime connection: {status.label}"
+					>
+						<span
+							class="inline-block h-2 w-2"
+							style:background-color={status.color}
+							style:animation={$connection === 'connecting'
+								? 'blink 900ms steps(2) infinite'
+								: undefined}
+						></span>
+						<span class="font-pixel text-[8px] text-muted">{status.label}</span>
+					</span>
+				{/if}
 
 				{#if data.user && data.profile}
 					<a

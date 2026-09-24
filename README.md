@@ -41,6 +41,13 @@ bun run test:e2e      # playwright
 ## Production
 
 ```sh
-bun run build         # vite build + realtime bundle
-bun run start         # node server.js — web + websocket on one port
+bun run build         # vite build + standalone realtime bundle (build/realtime.js)
+bun run start         # node server.js — web + websocket on one port (default 3000)
+bun run preview       # same as start (supports --port N)
 ```
+
+`server.js` accepts `--port N` (or `PORT` env). `vite preview` also works for multiplayer: the
+Vite plugin mounts the realtime server from `build/realtime.js` — just run `bun run build` first.
+
+> Realtime connections are authenticated (session cookie), so logged-out visitors never open a
+> WebSocket — that's expected, the nav shows a connection dot only for signed-in players.

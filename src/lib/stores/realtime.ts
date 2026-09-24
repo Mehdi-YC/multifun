@@ -30,6 +30,15 @@ export interface MatchResults {
 
 let client: RealtimeClient | null = null;
 
+// Connect as soon as this store module loads in the browser (the app shell
+// imports it for the connection dot), so every page — including the landing
+// page — is online without waiting for a lobby/game view to mount.
+if (typeof window !== 'undefined') {
+	queueMicrotask(() => {
+		realtime().connect();
+	});
+}
+
 export const connection: Writable<'idle' | 'connecting' | 'open' | 'closed'> = writable('idle');
 export const lobby: Writable<LobbySnapshot | null> = writable(null);
 export const chat: Writable<ChatLine[]> = writable([]);

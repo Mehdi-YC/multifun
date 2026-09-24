@@ -580,3 +580,11 @@ Notes from building Phase 0 (keep updated per milestone):
   `ws` into ESM output breaks on `require('events')`.
 - **Sim registry is node-safe:** the server imports only `modules/*/sim.ts` (never render code), so
   authoritative sims run in the server process without DOM shims.
+- **`vite preview` needs the WS too:** `server.js` mounts `/realtime`, `vite preview` does not — the
+  Vite plugin now has `configurePreviewServer` that loads `build/realtime.js` (with `.env` defaults)
+  so preview behaves like production. `bun run preview` runs `server.js` directly and accepts
+  `--port N`.
+- **Connect on app start:** the realtime store auto-connects on module load in the browser; before
+  that only lobby/game pages connected, leaving the landing page "offline". WS upgrades are
+  auth-gated, so logged-out visitors legitimately have no connection — the nav dot is hidden for
+  them instead of showing a scary "offline".
