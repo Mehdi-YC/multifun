@@ -26,6 +26,8 @@
 		selfMember
 	} from '$lib/stores/realtime';
 	import { GAME_META } from '$lib/game/meta';
+	import { LEVELS } from '$lib/game/geodash/levels';
+	import { ARENAS } from '$lib/game/tank/arena';
 	import type { AvatarConfig } from '$lib/game/assets/avatar';
 	import type { MemberSnapshot } from '$lib/net/protocol';
 	import type { PageData } from './$types';
@@ -49,6 +51,64 @@
 		label: value + ' players'
 	}));
 
+	// ---- game-content options (which level / arena the match is played on) ----
+
+	function asRecord(value: unknown): Record<string, unknown> {
+		return value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+	}
+
+	function prettifyId(id: string): string {
+		return id
+			.split(/[-_]/)
+			.filter(Boolean)
+			.map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+			.join(' ');
+	}
+
+	function difficultyPips(difficulty: unknown): string {
+		const n = Math.round(Number(difficulty));
+		const filled = Number.isFinite(n) ? Math.min(5, Math.max(1, n)) : 1;
+		return `[${'#'.repeat(filled)}${'.'.repeat(5 - filled)}]`;
+	}
+
+	function settingString(
+		settings: Record<string, unknown> | null | undefined,
+		key: string
+	): string {
+		const value = settings?.[key];
+		return typeof value === 'string' && value ? value : '';
+	}
+
+	function pickOption(
+		value: string,
+		fallback: string,
+		options: ReadonlyArray<{ value: string }>
+	): string {
+		if (options.some((option) => option.value === value)) return value;
+		if (options.some((option) => option.value === fallback)) return fallback;
+		return options[0]?.value ?? fallback;
+	}
+
+	const levelOptions = $derived(
+		LEVELS.map((level, index) => {
+			const entry = asRecord(level);
+			const id = String(entry.id || `level-${index + 1}`);
+			const name = String(entry.name || prettifyId(id));
+			return {
+				value: id,
+				label: `Level ${index + 1}: ${name} — ${difficultyPips(entry.difficulty)}`
+			};
+		})
+	);
+
+	const arenaOptions = $derived(
+		ARENAS.map((arena, index) => {
+			const entry = asRecord(arena);
+			const id = String(entry.id || `arena-${index + 1}`);
+			return { value: id, label: String(entry.name || prettifyId(id)) };
+		})
+	);
+
 	let joinError = $state<string | null>(null);
 	let draft = $state('');
 	let busy = $state(false);
@@ -56,6 +116,8 @@
 	let settingsName = $state('');
 	let settingsMax = $state('4');
 	let settingsPublic = $state(true);
+	let settingsLevel = $state('level-1');
+	let settingsArena = $state('crossfire');
 	let deleteOpen = $state(false);
 
 	const room = $derived($lobby ?? data.lobby);
@@ -76,6 +138,22 @@
 	const ranked = $derived(
 		[...($matchResults?.results ?? [])].sort((a, b) => a.placement - b.placement)
 	);
+	// Read-only label for the settings summary line: which level / arena this
+	// lobby is set to play (resolved through LEVELS / ARENAS for its name).
+	const matchContentLabel = $derived.by(() => {
+		if (!room) return '';
+		if (room.gameId === 'geodash') {
+			const id = settingString(room.settings, 'levelId') || 'level-1';
+			const level = LEVELS.map(asRecord).find((entry) => String(entry.id ?? '') === id);
+			return String(level?.name || prettifyId(id));
+		}
+		if (room.gameId === 'tank') {
+			const id = settingString(room.settings, 'arenaId') || 'crossfire';
+			const arena = ARENAS.map(asRecord).find((entry) => String(entry.id ?? '') === id);
+			return String(arena?.name || prettifyId(id));
+		}
+		return '';
+	});
 
 	// Membership can be revoked at any time (kick / lobby deleted / lobby
 	// closed): the store drops the lobby (or just this member) when that
@@ -243,18 +321,26 @@
 		settingsMax = String(room.maxPlayers);
 		// visibility is not part of the snapshot, so the host re-picks it here
 		settingsPublic = true;
+		// prefill the game-content selection from the room's saved settings
+		settingsLevel = pickOption(settingString(room.settings, 'levelId'), 'level-1', levelOptions);
+		settingsArena = pickOption(settingString(room.settings, 'arenaId'), 'crossfire', arenaOptions);
 		settingsOpen = true;
 	}
 
 	async function saveSettings(event: SubmitEvent) {
 		event.preventDefault();
 		if (!room) return;
+		// preserve any other stored keys and persist the game-content selection
+		const settings: Record<string, unknown> = { ...room.settings };
+		if (room.gameId === 'geodash') settings.levelId = settingsLevel;
+		else if (room.gameId === 'tank') settings.arenaId = settingsArena;
 		try {
 			await realtime().request('lobby.settings', {
 				lobbyId: room.id,
 				name: settingsName.trim() || room.name,
 				maxPlayers: Number(settingsMax),
-				isPublic: settingsPublic
+				isPublic: settingsPublic,
+				settings
 			});
 			settingsOpen = false;
 			toast('Lobby settings saved.', 'success');
@@ -390,7 +476,9 @@
 					</span>
 					<PixelButton variant="secondary" onclick={copyInvite}>Copy invite link</PixelButton>
 					<span class="font-body text-xs text-muted">
-						{gameMeta.players} · {gameMeta.title}
+						{gameMeta.players} · {gameMeta.title}{matchContentLabel
+							? ` · ${matchContentLabel}`
+							: ''}
 					</span>
 				</div>
 			</PixelPanel>
@@ -480,6 +568,11 @@
 <PixelModal title="Lobby settings" bind:open={settingsOpen}>
 	<form class="flex flex-col gap-4" onsubmit={saveSettings}>
 		<PixelInput label="Lobby name" bind:value={settingsName} />
+		{#if room?.gameId === 'geodash'}
+			<PixelSelect label="Level" options={levelOptions} bind:value={settingsLevel} />
+		{:else if room?.gameId === 'tank'}
+			<PixelSelect label="Arena" options={arenaOptions} bind:value={settingsArena} />
+		{/if}
 		<PixelSelect label="Max players" options={MAX_PLAYER_OPTIONS} bind:value={settingsMax} />
 		<PixelToggle label="Public lobby" bind:checked={settingsPublic} />
 		<div class="flex justify-end gap-2">
