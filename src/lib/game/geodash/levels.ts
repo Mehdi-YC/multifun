@@ -5,7 +5,7 @@
  * surface is y = 0, and objects anchor at their top-left corner. The floor is
  * made of `block` objects at y = 0 (see `floorSeg`), so missing floor = pit.
  *
- * Levels are built by composing patterns (see plan.md §6):
+ * Levels are built by composing patterns (see plan.md §7):
  * spike runs, staircases of blocks, jump-pad launches over gaps, saw
  * corridors, orb chains. Every level is beatable with a pure cube character —
  * levels.spec.ts proves it with an auto-playing bot driving the real sim.

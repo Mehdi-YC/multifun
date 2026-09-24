@@ -292,12 +292,73 @@ system the games will plug into.
 
 ---
 
-## 6. Phase 1 — GeoDash Party (multiplayer Geometry Dash-like)
+## 6. Phase 1 — Pixel Tanks (arena tank battle)
+
+Goal: 2–8 tanks, one arena, **2 lives each**, obstacles everywhere, level ups — last tank
+standing wins. Classic Battle City/Combat feel with modern online juice. **Status: playable**
+(sim, 3 arenas, renderer and platform integration shipped).
+
+### 6.1 Core gameplay
+
+- **Drive & shoot** — `LEFT/RIGHT` rotate the hull, `UP/DOWN` drive/reverse, `SPACE` (KEY.JUMP)
+  fires. Gamepad standard mapping works through the shared `InputManager`.
+- **2 lives each** — one shell hit = one life lost. First hit → 2s respawn (seeded-rng spawn point
+  farthest from living enemies) with 0.9s invulnerability (flashing tank, shells pass through).
+  Second hit → eliminated, ranked by lives → kills → damage → xp.
+- **Level ups** — XP from damage (10/hit) and eliminations (25). Levels 1–5 at 0/40/100/180/280
+  XP: each level +8% speed, −10% reload, +12% shell speed; level 5 shells bounce twice. Level
+  resets each match (it's a per-match power curve, not meta progression — see roadmap).
+
+### 6.2 Arenas & obstacles
+
+- Tile maps (30×17 tiles × 16px ≈ the 480×270 canvas), authored as char rows:
+  `#` steel wall, `C` crate, `~` water, `B` bush, `.` floor. Shipped arenas: **Crossfire**
+  (symmetric walls + crate clusters), **Islands** (water-heavy lanes), **Fortress** (central fort,
+  tight corridors). Hosts pick one via lobby settings (`arenaId`).
+- **Steel walls** — blocks tanks; shells **bounce once** (classic Tanks) and die on the second hit.
+- **Crates** — destructible (2 hits), block movement and shells.
+- **Water** — tanks can't cross, shells fly over.
+- **Bushes** — pure cover: tanks drive over, drawn on top of tanks.
+- Spawn points (8 per arena) validated on floor tiles and mutually reachable (flood-fill test).
+
+### 6.3 Match rules & results
+
+- **Last tank standing** wins; or `durationTicks` (120s) expires → ranked lives → kills → damage →
+  xp. `score = kills*100 + damage*10 + level*50 + lives*25`.
+- Shared 3/2/1/GO countdown freezes everyone before the first shot (tick-synchronized).
+- Events on the wire (all existing protocol kinds): `spawn`, `hit`, `death`, `collect` (item
+  `levelup` / `crate`), `finish` (elimination), `countdown`, `match-end`.
+
+### 6.4 Netcode
+
+- Deterministic 60Hz sim hosting all players server-side (same `GameSim` contract as the other
+  games): continuous float hull angles, seeded rng only — same inputs ⇒ identical `hash()`
+  (verified by golden-replay tests) and full `snapshot()/restore()` incl. rng state.
+- Clients: local prediction via a private sim, remote tanks interpolated ~100ms behind 20Hz
+  snapshots; explosions/hit/level events broadcast so everyone sees/hears the same fight.
+
+### 6.5 Feel & polish
+
+Explosions with debris + camera trauma, kill feed ("A ▸ B"), per-player HUD cards (lives as tank
+icons, level stars, kills), respawn countdown over the wreck, bush cover drawn above tanks,
+muzzle flashes and tread animation, `reducedMotion` respected.
+
+### 6.6 Roadmap for Pixel Tanks
+
+- **AI bots** to fill lobbies / solo play (spline-free: steering + LOS targeting, reuse the kart AI
+  plan), difficulty levels.
+- Team deathmatch (2 teams), capture-the-flag variant, sudden-death shrinking arena.
+- Power-up crates (rapid fire, shield, mine), more arenas + a procedural daily arena.
+- Meta progression: unlockable tank skins (avatar system already stores `avatarJson`).
+
+---
+
+## 7. Phase 2 — GeoDash Party (multiplayer Geometry Dash-like)
 
 Goal: 2–8 players race the same auto-runner level simultaneously, dying and respawning, first to
 the finish wins. Fast, fair, readable, replayable.
 
-### 6.1 Core gameplay
+### 7.1 Core gameplay
 
 - Player cube auto-runs right at constant speed; input = **jump / hold-jump (multi-jump gated by
   pads) / special (mode action)**. Death on spike/crash; instant retry feel is sacred (≤ 400ms
@@ -309,7 +370,7 @@ the finish wins. Fast, fair, readable, replayable.
   platforms synced to music beats.
 - Camera: player held at ~35% from left, vertical smoothing, subtle zoom on speed changes.
 
-### 6.2 Level format & content
+### 7.2 Level format & content
 
 - Level JSON: `{ id, name, song, bpm, lengthPx, difficulty, objects: [{type, x, y, rot?, props?}] }`.
 - Ship **6 handcrafted levels** (Easy → Harder) + **Daily Level** generated deterministically from
@@ -317,7 +378,7 @@ the finish wins. Fast, fair, readable, replayable.
 - Later: in-game **level editor** (palette of objects, place/delete, playtest, export JSON code).
   Kept in scope for Phase 1.5 because it multiplies content cheaply.
 
-### 6.3 Multiplayer modes
+### 7.3 Multiplayer modes
 
 - **Race (default):** simultaneous start, live opponents drawn as translucent colored "ghosts"
   (their position from `game.snap` interpolation; no collision between players), first to reach the
@@ -328,7 +389,7 @@ the finish wins. Fast, fair, readable, replayable.
 - **Practice:** solo, checkpoints, best-time leaderboards per level.
 - Anti-finish-griefing: match ends when winner finishes or 90s timer expires.
 
-### 6.4 Netcode for GeoDash
+### 7.4 Netcode for GeoDash
 
 - Simulation is **deterministic** (fixed 60Hz tick, integer/fixed-point-friendly math, seeded
   level). Inputs are tiny (`jump held`, `special held`) → broadcast `input` at 30Hz (or on change).
@@ -338,7 +399,7 @@ the finish wins. Fast, fair, readable, replayable.
   broadcasts `game.event` (death, respawn, orb hit, finish) so SFX/VFX are shared.
 - Reconnect: rejoin as spectator (ghost-only) unless still in the first 10s of a match.
 
-### 6.5 Feel & polish (this is what makes it "good UX")
+### 7.5 Feel & polish (this is what makes it "good UX")
 
 - **Music sync:** level BPM drives background pulses, ground bounce, and obstacle timing; countdown
   3-2-1-GO snaps to the bar. Music = original chiptune loop composed in-repo, per-level track.
@@ -351,7 +412,7 @@ the finish wins. Fast, fair, readable, replayable.
 - **Accessibility:** colorblind-safe player colors (shape + color distinction), reduced-motion mode
   (no shake/flash), separate Music/SFX volume sliders.
 
-### 6.6 Phase 1 acceptance criteria
+### 7.6 Phase 2 acceptance criteria
 
 - [ ] 4 players race the same level smoothly at 60fps; ghosts interpolate without jitter.
 - [ ] Determinism test: same recorded input stream ⇒ identical sim hash on client & server.
@@ -361,12 +422,12 @@ the finish wins. Fast, fair, readable, replayable.
 
 ---
 
-## 7. Phase 2 — Turbo Kart
+## 8. Phase 3 — Turbo Kart
 
 Goal: a top-down pixel kart racer that feels great: drift-boost mechanics, tight controls, readable
 tracks, and online races for 2–8 players.
 
-### 7.1 Presentation
+### 8.1 Presentation
 
 - Top-down 2D pixel (SNES Mario Kart-style), 16-direction sprite rotation (pre-rotated atlas),
   internal 480×270 canvas scaled up, layered track rendering (ground → road → decals → karts →
@@ -374,7 +435,7 @@ tracks, and online races for 2–8 players.
 - HUD: position, lap (x/3), speedometer, item slot, minimap, lap-time splits (best lap flashes),
   drift-charge indicator.
 
-### 7.2 Mechanics (the "fun" list)
+### 8.2 Mechanics (the "fun" list)
 
 - **Drift system:** hold drift (R/shoulder) + steer → kart slides; charge tiers spark blue → orange
   → purple; release for mini-turbo boost scaled by tier. Hop-drift to initiate tight turns.
@@ -389,7 +450,7 @@ tracks, and online races for 2–8 players.
 - **AI karts** (fill lobbies): spline-following with rubber-banding lite, drift usage, item usage,
   difficulty setting (Easy/Medium/Hard).
 
-### 7.3 Tracks
+### 8.3 Tracks
 
 - Track format: tilemap + centerline spline (checkpoints, respawn points, AI line, item box spots,
   minimap). 3 tracks at launch:
@@ -398,7 +459,7 @@ tracks, and online races for 2–8 players.
   3. **Frostbite Falls** — slippery ice tiles, jump gaps, moving hazard.
 - Mode: 3-lap race, plus Time Trial (solo, ghost of your best lap saved as input replay).
 
-### 7.4 Netcode (kart)
+### 8.4 Netcode (kart)
 
 - Client-side **prediction + server reconciliation**: client simulates own kart immediately from
   input; server runs all karts at 60Hz from broadcast inputs, sends 20Hz snapshots; client
@@ -408,14 +469,14 @@ tracks, and online races for 2–8 players.
 - Collisions between karts resolved on the server (bounce + tiny slowdown), reported via snapshot.
 - Finish detection server-side; results carry per-lap splits.
 
-### 7.5 UX targets
+### 8.5 UX targets
 
 - Gamepad-first feel: analog steering mapped to digital 16-dir sprites, rumble on drift/boost/hit.
 - Instant restart, pause menu (settings, leave), countdown with camera pull-back, results screen
   with per-lap table and "rematch".
 - 60fps on integrated GPUs; particles pooled; atlas batching; no per-frame allocation in the loop.
 
-### 7.6 Phase 2 acceptance criteria
+### 8.6 Phase 3 acceptance criteria
 
 - [ ] Online 4-player race completes with correct placements and lap splits; rubber-banding is
       invisible (no teleporting under normal latency ≤ 100ms simulated).
@@ -425,12 +486,12 @@ tracks, and online races for 2–8 players.
 
 ---
 
-## 8. Phase 3 — Pixel Brawl (platform fighter)
+## 9. Phase 4 — Pixel Brawl (platform fighter)
 
 Goal: a Brawlhalla-like 2D platform fighter for 1v1 and free-for-all (2–4 players), fast and
 readable in pixel art.
 
-### 8.1 Mechanics
+### 9.1 Mechanics
 
 - Stocks + damage %: knockback scales with damage; KO into blast zones; respawn platform with
   invulnerability.
@@ -441,19 +502,19 @@ readable in pixel art.
 - Stages: 3 stages with soft platforms, moving platform variants, and a "small blast zone" ranked
   variant. Hazards toggle for casual play.
 
-### 8.2 Netcode (fighter)
+### 9.2 Netcode (fighter)
 
 - Deterministic sim at 60Hz with **input delay (2–3 frames) + rollback-lite** for remote players:
   on input mismatch, rewind to confirmed state and replay. Because the sim is deterministic and
   state is small (4 players × physics state), rollback is feasible.
 - Server validates match results and detects divergent sim hashes (log + resync).
 
-### 8.3 UX
+### 9.3 UX
 
 - Character select with animated pixel portraits, damage HUD per player with color + shape,
   kill-screen flash + zoom punch, pause/forfeit, best-of-3 stock rules for 1v1.
 
-### 8.4 Phase 3 acceptance criteria
+### 9.4 Phase 4 acceptance criteria
 
 - [ ] 1v1 online match feels responsive (perceived input latency < 3 frames at 60ms RTT).
 - [ ] Rollback never visibly teleports players in normal conditions; sim divergence is detected.
@@ -461,7 +522,7 @@ readable in pixel art.
 
 ---
 
-## 9. Phase 4 — Platform polish & social
+## 10. Phase 5 — Platform polish & social
 
 - Friends list + invites ("invite to lobby" from profile), recent players, block.
 - Matchmaking queues per game (casual), ranked with visible rating per game, season resets later.
@@ -474,7 +535,7 @@ readable in pixel art.
 
 ---
 
-## 10. Cross-Cutting Concerns
+## 11. Cross-Cutting Concerns
 
 ### Engine & performance budgets
 
@@ -512,29 +573,30 @@ readable in pixel art.
 
 ---
 
-## 11. Milestones & Rough Order
+## 12. Milestones & Rough Order
 
-| #   | Milestone                     | Deliverable                                                  | Depends on | Status  |
-| --- | ----------------------------- | ------------------------------------------------------------ | ---------- | ------- |
-| M0  | Hygiene + pixel design system | themed shell, UI kit + stories, adapter-node, WS bootstrap   | —          | ✅      |
-| M1  | Profiles & avatar builder     | signup → profile → avatar builder, profile pages             | M0         | ✅      |
-| M2  | Realtime + lobbies            | lobby create/join/code/list, presence, chat, host controls   | M0         | ✅      |
-| M3  | Game shell + stub game        | match lifecycle, results screen, leaderboards                | M1, M2     | ✅      |
-| M4  | GeoDash core                  | cube mode, 3 levels, solo play, death/retry loop, music sync | M3         | ⬜ next |
-| M5  | GeoDash multiplayer           | race mode with ghosts, server validation, daily level        | M4         | ⬜      |
-| M6  | GeoDash polish + editor       | wave/ball modes, level editor, sudden death, leaderboards    | M5         | ⬜      |
-| M7  | Turbo Kart core               | kart physics, drift-boost, 1 track, local play + AI          | M3         | ⬜      |
-| M8  | Turbo Kart online             | prediction/reconciliation, items, 3 tracks, time trial       | M7         | ⬜      |
-| M9  | Pixel Brawl core              | movement/combat, 1 character, 1 stage, local versus          | M3         | ⬜      |
-| M10 | Pixel Brawl online            | rollback-lite, 3 characters, 3 stages, stocks/FFA            | M9         | ⬜      |
-| M11 | Social & platform polish      | friends, matchmaking, spectators, achievements, touch        | M5/M8/M10  | ⬜      |
+| #   | Milestone                     | Deliverable                                                   | Depends on   | Status  |
+| --- | ----------------------------- | ------------------------------------------------------------- | ------------ | ------- |
+| M0  | Hygiene + pixel design system | themed shell, UI kit + stories, adapter-node, WS bootstrap    | —            | ✅      |
+| M1  | Profiles & avatar builder     | signup → profile → avatar builder, profile pages              | M0           | ✅      |
+| M2  | Realtime + lobbies            | lobby create/join/code/list, presence, chat, host controls    | M0           | ✅      |
+| M3  | Game shell + stub game        | match lifecycle, results screen, leaderboards                 | M1, M2       | ✅      |
+| M4  | Pixel Tanks core + online     | arenas, obstacles, 2 lives, level ups, ranked results         | M3           | ✅      |
+| M5  | GeoDash core + race           | cube mode, 3 levels, ghost races, server-validated results    | M3           | ✅      |
+| M6  | Pixel Tanks: bots + modes     | AI bots (solo + lobby fill), team deathmatch, power-up crates | M4           | ⬜ next |
+| M7  | GeoDash polish + editor       | daily level, wave/ball modes, level editor, sudden death      | M5           | ⬜      |
+| M8  | Turbo Kart core               | kart physics, drift-boost, 1 track, local play + AI           | M3           | ⬜      |
+| M9  | Turbo Kart online             | prediction/reconciliation, items, 3 tracks, time trial        | M8           | ⬜      |
+| M10 | Pixel Brawl core              | movement/combat, 1 character, 1 stage, local versus           | M3           | ⬜      |
+| M11 | Pixel Brawl online            | rollback-lite, 3 characters, 3 stages, stocks/FFA             | M10          | ⬜      |
+| M12 | Social & platform polish      | friends, matchmaking, spectators, achievements, touch         | M6/M7/M9/M11 | ⬜      |
 
 Each milestone ends with: `check`/`lint`/tests green, updated README screenshots, this file updated
 (decisions + acceptance criteria checked off).
 
 ---
 
-## 12. Risks & Decisions Log
+## 13. Risks & Decisions Log
 
 | Risk                                          | Mitigation                                                                                         |
 | --------------------------------------------- | -------------------------------------------------------------------------------------------------- |
@@ -564,7 +626,7 @@ Each milestone ends with: `check`/`lint`/tests green, updated README screenshots
 
 ---
 
-## 13. Implementation log
+## 14. Implementation log
 
 Notes from building Phase 0 (keep updated per milestone):
 
