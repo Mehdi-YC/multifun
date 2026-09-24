@@ -77,6 +77,11 @@ test('two players: lobby by code, chat, ready, match with results', async ({ bro
 	await pageA.getByRole('button', { name: 'Ready up' }).click();
 	await expect(pageA.getByRole('button', { name: 'Not ready' })).toBeVisible();
 
+	// a page reload must NOT un-ready players (regression: rejoin wiped isReady)
+	await pageB.reload();
+	await expect(pageB.getByRole('button', { name: 'Not ready' })).toBeVisible();
+	await expect(pageA.getByRole('button', { name: 'START GAME' })).toBeEnabled();
+
 	// --- host starts the match ---
 	await pageA.getByRole('button', { name: 'START GAME' }).click();
 

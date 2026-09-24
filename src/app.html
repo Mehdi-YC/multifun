@@ -4,6 +4,21 @@
 		<meta charset="utf-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1" />
 		<meta name="text-scale" content="scale" />
+		<script>
+			// This app never registers a service worker. A stale one registered on this
+			// origin by a different app intercepts navigations and serves old shells
+			// (seen as mysterious reloads + endless 404s for /sw.js). Remove them all.
+			if ('serviceWorker' in navigator) {
+				navigator.serviceWorker.getRegistrations().then((regs) => {
+					for (const reg of regs) reg.unregister();
+				});
+				if (window.caches?.keys) {
+					caches.keys().then((keys) => {
+						for (const key of keys) caches.delete(key);
+					});
+				}
+			}
+		</script>
 		%sveltekit.head%
 	</head>
 	<body data-sveltekit-preload-data="hover">

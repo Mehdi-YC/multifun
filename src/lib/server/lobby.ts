@@ -52,9 +52,11 @@ export async function joinLobby(
 		.where(and(eq(lobbyMember.lobbyId, lobbyId), isNull(lobbyMember.leftAt)));
 	const existing = members.find((m) => m.userId === userId);
 	if (existing) {
+		// Rejoin (page reload, reconnect): reclaim the slot but keep ready state —
+		// a refresh must never silently un-ready a player.
 		await db
 			.update(lobbyMember)
-			.set({ leftAt: null, isReady: false })
+			.set({ leftAt: null })
 			.where(and(eq(lobbyMember.lobbyId, lobbyId), eq(lobbyMember.userId, userId)));
 		return;
 	}
