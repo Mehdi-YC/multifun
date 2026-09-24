@@ -153,7 +153,10 @@ export const matchPlayer = sqliteTable(
 		statsJson: text('stats_json').notNull().default('{}'),
 		disconnected: integer('disconnected', { mode: 'boolean' }).notNull().default(false)
 	},
-	(t) => [primaryKey({ columns: [t.matchId, t.userId] }), index('match_player_user_idx').on(t.userId)]
+	(t) => [
+		primaryKey({ columns: [t.matchId, t.userId] }),
+		index('match_player_user_idx').on(t.userId)
+	]
 );
 
 /** Individual attempts/runs (e.g. GeoDash level attempts, kart lap records). */
@@ -171,7 +174,9 @@ export const run = sqliteTable(
 		/** level id / track id / stage id depending on game. */
 		levelId: text('level_id').notNull(),
 		value: integer('value').notNull(),
-		unit: text('unit', { enum: ['ms', 'score', 'progress'] }).notNull().default('score'),
+		unit: text('unit', { enum: ['ms', 'score', 'progress'] })
+			.notNull()
+			.default('score'),
 		endedAt: integer('ended_at', { mode: 'timestamp_ms' })
 			.default(sql`(cast(unixepoch('subsecond') * 1000 as integer))`)
 			.notNull()

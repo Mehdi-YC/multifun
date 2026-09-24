@@ -1,11 +1,5 @@
 import { describe, expect, it, vi, afterEach } from 'vitest';
-import type {
-	GameConfig,
-	GameEvent,
-	GameSim,
-	InputFrame,
-	MatchResult
-} from '$lib/game/types';
+import type { GameConfig, GameEvent, GameSim, InputFrame, MatchResult } from '$lib/game/types';
 import type { ServerMessage } from '$lib/net/protocol';
 import { GameRoom } from './game-room';
 

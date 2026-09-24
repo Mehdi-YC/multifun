@@ -34,10 +34,7 @@ export async function finishMatch(
 	results: MatchResult[],
 	status: 'finished' | 'aborted' = 'finished'
 ): Promise<void> {
-	await db
-		.update(match)
-		.set({ status, endedAt: new Date() })
-		.where(eq(match.id, matchId));
+	await db.update(match).set({ status, endedAt: new Date() }).where(eq(match.id, matchId));
 	for (const r of results) {
 		await db
 			.update(matchPlayer)

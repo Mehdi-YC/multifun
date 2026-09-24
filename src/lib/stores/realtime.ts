@@ -2,7 +2,7 @@
  * Svelte-facing singleton for the realtime client + live platform state
  * (connection status, current lobby, chat, active match).
  */
-import { writable, type Readable, type Writable } from 'svelte/store';
+import { get, writable, type Writable } from 'svelte/store';
 import { RealtimeClient } from '$lib/game/netcode/realtime-client';
 import type { LobbySnapshot, MemberSnapshot, ServerMessage } from '$lib/net/protocol';
 import type { GameId, MatchResult } from '$lib/game/types';
@@ -40,7 +40,17 @@ export const matchResults: Writable<MatchResults | null> = writable(null);
 export function realtime(): RealtimeClient {
 	if (!client) {
 		client = new RealtimeClient();
-		client.onStatus((status) => connection.set(status));
+		client.onStatus((status) => {
+			connection.set(status);
+			// Re-attach to the current lobby after a reconnect (server holds the
+			// slot for a grace period but the room membership is per-connection).
+			if (status === 'open') {
+				const current = get(lobby);
+				if (current && current.status !== 'closed') {
+					void client!.request('lobby.join', { code: current.code }).catch(() => {});
+				}
+			}
+		});
 		client.on('lobby.state', (msg) => {
 			lobby.set(structuredClone(msg.d));
 		});

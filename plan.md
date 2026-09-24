@@ -20,7 +20,7 @@ Guiding principles:
 
 - **Pixel-perfect presentation.** Fixed internal resolution, integer-scaled canvas,
   `image-rendering: pixelated`, hand-generated sprites, chunky UI font, consistent palette per game
-  + platform chrome.
+  - platform chrome.
 - **Lobby-first multiplayer.** Every game starts from a lobby (create / join by code / public list).
   The lobby is the social hub: ready states, chat, host controls, rematch.
 - **Playable over perfect.** Every phase ends with something fun and multiplayer-playable. Polish is
@@ -113,19 +113,20 @@ Each game is a self-contained module the platform can host:
 
 ```ts
 interface GameModule {
-  id: GameId;                       // 'geodash' | 'kart' | 'brawl'
-  createClient(ctx: GameContext): GameClient;   // rendering + input + prediction
-  createSim(seed: number, config: GameConfig): GameSim;  // deterministic, used client & server
-  defaults: GameConfig;
-  minPlayers: number; maxPlayers: number;
+	id: GameId; // 'geodash' | 'kart' | 'brawl'
+	createClient(ctx: GameContext): GameClient; // rendering + input + prediction
+	createSim(seed: number, config: GameConfig): GameSim; // deterministic, used client & server
+	defaults: GameConfig;
+	minPlayers: number;
+	maxPlayers: number;
 }
 
 interface GameSim {
-  tick(inputs: Map<PlayerId, InputFrame>): void;  // fixed timestep
-  events: GameEvent[];                            // drained each tick
-  snapshot(): GameStatePatch;
-  restore(state: unknown): void;
-  finished: boolean;
+	tick(inputs: Map<PlayerId, InputFrame>): void; // fixed timestep
+	events: GameEvent[]; // drained each tick
+	snapshot(): GameStatePatch;
+	restore(state: unknown): void;
+	finished: boolean;
 }
 ```
 
@@ -277,11 +278,14 @@ system the games will plug into.
 
 ### Phase 0 acceptance criteria
 
-- [ ] Two browsers can sign up, create/join a lobby by code, chat, ready up, start the stub game,
-      see each other move, finish, and see a results screen; all data survives refresh.
-- [ ] Host disconnect migrates host; player reconnect reclaims their slot.
-- [ ] All UI components have Storybook stories; `check`, `lint`, unit + e2e tests pass.
-- [ ] WS traffic validated (bad messages rejected with `err`), no unbounded memory (rooms cleaned up).
+- [x] Two browsers can sign up, create/join a lobby by code, chat, ready up, start the stub game,
+      see each other move, finish, and see a results screen; all data survives refresh
+      (`src/tests/core-flow.e2e.ts`).
+- [x] Host disconnect migrates host; player reconnect reclaims their slot (30s grace in
+      `LobbyRoom`, auto re-join on reconnect in `stores/realtime.ts`).
+- [x] All UI components have Storybook stories; `check`, `lint`, unit + e2e tests pass.
+- [x] WS traffic validated (zod on every inbound message), rooms cleaned up (empty-room close,
+      connection sweep, chat history trim).
 
 ---
 
@@ -478,9 +482,9 @@ readable in pixel art.
 ### Asset pipeline (no external sprites)
 
 - Sprites authored **in code**: `src/lib/game/assets/generate/*.ts` draws pixel art into PNG atlases
-  + JSON metadata at build time (`bun run gen:assets`), committed to `static/sprites/`.
-  Per-game palette (e.g. 32-color ramps) keeps everything cohesive; real art can replace atlases
-  later without touching game code.
+  - JSON metadata at build time (`bun run gen:assets`), committed to `static/sprites/`.
+    Per-game palette (e.g. 32-color ramps) keeps everything cohesive; real art can replace atlases
+    later without touching game code.
 - Audio: WebAudio-synthesized SFX (jump, boost, hit, UI blips) + chiptune loops generated as WAV
   samples in-repo; no external audio dependencies.
 
@@ -507,20 +511,20 @@ readable in pixel art.
 
 ## 11. Milestones & Rough Order
 
-| #   | Milestone                      | Deliverable                                                 | Depends on |
-| --- | ------------------------------ | ----------------------------------------------------------- | ---------- |
-| M0  | Hygiene + pixel design system  | themed shell, UI kit + stories, adapter-node, WS bootstrap  | —          |
-| M1  | Profiles & avatar builder      | signup → profile → avatar builder, profile pages            | M0         |
-| M2  | Realtime + lobbies             | lobby create/join/code/list, presence, chat, host controls  | M0         |
-| M3  | Game shell + stub game         | match lifecycle, results screen, leaderboards               | M1, M2     |
-| M4  | GeoDash core                   | cube mode, 3 levels, solo play, death/retry loop, music sync | M3         |
-| M5  | GeoDash multiplayer            | race mode with ghosts, server validation, daily level       | M4         |
-| M6  | GeoDash polish + editor        | wave/ball modes, level editor, sudden death, leaderboards   | M5         |
-| M7  | Turbo Kart core                | kart physics, drift-boost, 1 track, local play + AI         | M3         |
-| M8  | Turbo Kart online              | prediction/reconciliation, items, 3 tracks, time trial      | M7         |
-| M9  | Pixel Brawl core               | movement/combat, 1 character, 1 stage, local versus         | M3         |
-| M10 | Pixel Brawl online             | rollback-lite, 3 characters, 3 stages, stocks/FFA           | M9         |
-| M11 | Social & platform polish       | friends, matchmaking, spectators, achievements, touch       | M5/M8/M10  |
+| #   | Milestone                     | Deliverable                                                  | Depends on | Status  |
+| --- | ----------------------------- | ------------------------------------------------------------ | ---------- | ------- |
+| M0  | Hygiene + pixel design system | themed shell, UI kit + stories, adapter-node, WS bootstrap   | —          | ✅      |
+| M1  | Profiles & avatar builder     | signup → profile → avatar builder, profile pages             | M0         | ✅      |
+| M2  | Realtime + lobbies            | lobby create/join/code/list, presence, chat, host controls   | M0         | ✅      |
+| M3  | Game shell + stub game        | match lifecycle, results screen, leaderboards                | M1, M2     | ✅      |
+| M4  | GeoDash core                  | cube mode, 3 levels, solo play, death/retry loop, music sync | M3         | ⬜ next |
+| M5  | GeoDash multiplayer           | race mode with ghosts, server validation, daily level        | M4         | ⬜      |
+| M6  | GeoDash polish + editor       | wave/ball modes, level editor, sudden death, leaderboards    | M5         | ⬜      |
+| M7  | Turbo Kart core               | kart physics, drift-boost, 1 track, local play + AI          | M3         | ⬜      |
+| M8  | Turbo Kart online             | prediction/reconciliation, items, 3 tracks, time trial       | M7         | ⬜      |
+| M9  | Pixel Brawl core              | movement/combat, 1 character, 1 stage, local versus          | M3         | ⬜      |
+| M10 | Pixel Brawl online            | rollback-lite, 3 characters, 3 stages, stocks/FFA            | M9         | ⬜      |
+| M11 | Social & platform polish      | friends, matchmaking, spectators, achievements, touch        | M5/M8/M10  | ⬜      |
 
 Each milestone ends with: `check`/`lint`/tests green, updated README screenshots, this file updated
 (decisions + acceptance criteria checked off).
@@ -529,15 +533,15 @@ Each milestone ends with: `check`/`lint`/tests green, updated README screenshots
 
 ## 12. Risks & Decisions Log
 
-| Risk                                                | Mitigation                                                                                                    |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| SvelteKit WS upgrade wiring is fiddly                | Keep `RealtimeServer` transport-agnostic; documented fallback = separate WS process on own port               |
-| Determinism drift between client & server sim        | Fixed-point-friendly math, shared code, golden replay tests + sim hash checks per match                        |
-| Latency makes kart/fighter feel bad                  | Prediction + reconciliation (kart), input delay + rollback-lite (brawl), artificial-lag soak tests             |
-| Scope creep in "good UX" polish                      | Feel targets listed per phase; polish is scheduled in milestones, not open-ended                               |
-| Pixel art quality without an artist                  | Code-generated atlases + strict palettes; cohesive style beats quantity; art can be swapped later              |
-| SQLite write contention once matches pile up         | WAL mode, short transactions, single writer discipline; schema portable to Postgres                            |
-| Cheating (score/finish tampering)                    | Server-side sim validation + envelope checks; treat client state as untrusted everywhere                       |
+| Risk                                          | Mitigation                                                                                         |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| SvelteKit WS upgrade wiring is fiddly         | Keep `RealtimeServer` transport-agnostic; documented fallback = separate WS process on own port    |
+| Determinism drift between client & server sim | Fixed-point-friendly math, shared code, golden replay tests + sim hash checks per match            |
+| Latency makes kart/fighter feel bad           | Prediction + reconciliation (kart), input delay + rollback-lite (brawl), artificial-lag soak tests |
+| Scope creep in "good UX" polish               | Feel targets listed per phase; polish is scheduled in milestones, not open-ended                   |
+| Pixel art quality without an artist           | Code-generated atlases + strict palettes; cohesive style beats quantity; art can be swapped later  |
+| SQLite write contention once matches pile up  | WAL mode, short transactions, single writer discipline; schema portable to Postgres                |
+| Cheating (score/finish tampering)             | Server-side sim validation + envelope checks; treat client state as untrusted everywhere           |
 
 ### Locked decisions
 
@@ -554,3 +558,25 @@ Each milestone ends with: `check`/`lint`/tests green, updated README screenshots
 - Kart camera: fixed north-up vs rotating camera behind kart (rotating reads better with drift;
   costs sprite-rotation work). Prototype both in M7 and pick by feel.
 - Voice/presence extras ("playing now" sidebar) — Phase 4 backlog.
+
+---
+
+## 13. Implementation log
+
+Notes from building Phase 0 (keep updated per milestone):
+
+- **better-auth + dev ports:** `svelteKitHandler` only routes `/api/auth/*` when the request origin
+  matches `baseURL`; hardcoding `ORIGIN` broke every non-default port. `auth.ts` now treats an empty
+  `ORIGIN` as "derive from request".
+- **Prod entry env:** adapter-node rejects an empty `ORIGIN` at import time, so `server.js` defaults
+  `ORIGIN` (and uses top-level await imports) before loading `build/handler.js`. `bun run start`
+  loads `.env` via `node --env-file`.
+- **Realtime client reliability:** `request()` awaits socket open (kills the connect/join race), the
+  client sends 10s heartbeats (server drops 30s-silent conns), and the store auto-rejoins its lobby
+  after a reconnect.
+- **Lobby membership broadcast:** `LobbyRoom.join` must broadcast `lobby.state` to the whole room —
+  broadcasting only presence left existing members rendering a stale roster (caught by e2e).
+- **Prod realtime bundle:** `ws` + `better-sqlite3` stay external in the esbuild step; bundling CJS
+  `ws` into ESM output breaks on `require('events')`.
+- **Sim registry is node-safe:** the server imports only `modules/*/sim.ts` (never render code), so
+  authoritative sims run in the server process without DOM shims.

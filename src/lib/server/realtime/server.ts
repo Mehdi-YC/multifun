@@ -34,9 +34,7 @@ import {
 	PROTOCOL_VERSION,
 	parseClientMessage,
 	requestPayloads,
-	type ClientMessage,
-	type LobbySnapshot,
-	type ServerMessage
+	type LobbySnapshot
 } from '$lib/net/protocol';
 import type { MatchResult, SimPlayer } from '$lib/game/types';
 

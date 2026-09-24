@@ -10,7 +10,20 @@ import WebSocket from 'ws';
 const BASE = process.env.SMOKE_BASE ?? 'http://localhost:5173';
 const WS_URL = BASE.replace(/^http/, 'ws') + '/realtime';
 
-type Frame = { t: string; id?: number; ok?: boolean; d?: any; err?: { code: string; msg: string } };
+type Frame = {
+	t: string;
+	id?: number;
+	ok?: boolean;
+	d?: {
+		lobby?: { id: string; code: string; members: unknown[] };
+		lobbies?: { code: string }[];
+		matchId?: string;
+		tick?: number;
+		players?: unknown[];
+		results?: { placement: number; score: number }[];
+	};
+	err?: { code: string; msg: string };
+};
 
 function log(step: string, detail: unknown = ''): void {
 	console.log(`✓ ${step}`, detail);
@@ -98,11 +111,12 @@ async function main(): Promise<void> {
 		isPublic: true,
 		settings: {}
 	});
-	const lobbyState = create.d.lobby;
+	const lobbyState = create.d?.lobby;
+	if (!lobbyState) throw new Error('no lobby in create ack');
 	log('lobby.create', `code=${lobbyState.code} members=${lobbyState.members.length}`);
 
 	const list = await wire.req('lobby.list', {});
-	const listed = (list.d.lobbies ?? []).some((l: { code: string }) => l.code === lobbyState.code);
+	const listed = (list.d?.lobbies ?? []).some((l) => l.code === lobbyState.code);
 	if (!listed) throw new Error('created lobby not in public list');
 	log('lobby.list shows the new lobby');
 
@@ -115,22 +129,27 @@ async function main(): Promise<void> {
 
 	await wire.req('lobby.start', { lobbyId: lobbyState.id });
 	const gameStart = await wire.waitFor((m) => m.t === 'game.start', 8000, 'game.start');
-	log('game.start', `match=${gameStart.d.matchId} players=${gameStart.d.players.length}`);
+	const matchId = gameStart.d?.matchId;
+	if (!matchId) throw new Error('no matchId in game.start');
+	log('game.start', `match=${matchId} players=${gameStart.d?.players?.length}`);
 
 	let seq = 0;
 	const inputTimer = setInterval(() => {
 		wire.send({
 			t: 'input',
-			d: { matchId: gameStart.d.matchId, tick: seq, seq, keys: 8 | 16 }
+			d: { matchId, tick: seq, seq, keys: 8 | 16 }
 		});
 		seq++;
 	}, 100);
 
 	const snap = await wire.waitFor((m) => m.t === 'game.snap', 8000, 'game.snap');
-	log('game.snap flowing', `tick=${snap.d.tick}`);
+	log('game.snap flowing', `tick=${snap.d?.tick}`);
 	const gameEnd = await wire.waitFor((m) => m.t === 'game.end', 35000, 'game.end');
 	clearInterval(inputTimer);
-	log('game.end', `results=${JSON.stringify(gameEnd.d.results.map((r: any) => [r.placement, r.score]))}`);
+	log(
+		'game.end',
+		`results=${JSON.stringify((gameEnd.d?.results ?? []).map((r) => [r.placement, r.score]))}`
+	);
 
 	await wire.req('lobby.leave', { lobbyId: lobbyState.id });
 	log('lobby.leave');

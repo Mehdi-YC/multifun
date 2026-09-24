@@ -128,11 +128,7 @@ export async function setLobbyStatus(lobbyId: string, status: LobbyStatus): Prom
 }
 
 export async function getLobbyByCode(code: string): Promise<typeof lobby.$inferSelect | null> {
-	const [row] = await db
-		.select()
-		.from(lobby)
-		.where(eq(lobby.code, code.toUpperCase()))
-		.limit(1);
+	const [row] = await db.select().from(lobby).where(eq(lobby.code, code.toUpperCase())).limit(1);
 	return row ?? null;
 }
 
@@ -141,9 +137,7 @@ export async function getLobbyById(id: string): Promise<typeof lobby.$inferSelec
 	return row ?? null;
 }
 
-export async function activeMembers(
-	lobbyId: string
-): Promise<(typeof lobbyMember.$inferSelect)[]> {
+export async function activeMembers(lobbyId: string): Promise<(typeof lobbyMember.$inferSelect)[]> {
 	return db
 		.select()
 		.from(lobbyMember)

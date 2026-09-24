@@ -7,7 +7,7 @@ import type { GameEvent, GameId, GameStatePatch, MatchResult } from '$lib/game/t
 
 export const PROTOCOL_VERSION = 1;
 
-const gameEventSchema: z.ZodType<GameEvent> = z.lazy(() =>
+export const gameEventSchema: z.ZodType<GameEvent> = z.lazy(() =>
 	z.discriminatedUnion('kind', [
 		z.object({ kind: z.literal('spawn'), player: z.string() }),
 		z.object({ kind: z.literal('death'), player: z.string(), cause: z.string() }),

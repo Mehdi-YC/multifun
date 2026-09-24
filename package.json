@@ -6,8 +6,8 @@
 	"scripts": {
 		"dev": "vite dev",
 		"build": "vite build && bun run build:realtime",
-		"build:realtime": "bun x esbuild scripts/realtime-entry.ts --bundle --platform=node --format=esm --outfile=build/realtime.js --alias:\\$app/server=./scripts/shims/app-server.ts --alias:\\$env/dynamic/private=./scripts/shims/env-private.ts --external:better-sqlite3",
-		"start": "node server.js",
+		"build:realtime": "bun x esbuild scripts/realtime-entry.ts --bundle --platform=node --format=esm --outfile=build/realtime.js --alias:\\$app/server=./scripts/shims/app-server.ts --alias:\\$env/dynamic/private=./scripts/shims/env-private.ts --external:better-sqlite3 --external:ws",
+		"start": "node --env-file=.env server.js",
 		"preview": "vite preview",
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",

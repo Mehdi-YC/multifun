@@ -17,6 +17,8 @@ interface Pending {
 }
 
 const REQUEST_TIMEOUT_MS = 5_000;
+const OPEN_TIMEOUT_MS = 5_000;
+const HEARTBEAT_MS = 10_000;
 const BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 
 export class RealtimeClient {
@@ -28,17 +30,20 @@ export class RealtimeClient {
 	private statusHandlers = new Set<StatusHandler>();
 	private backoffIndex = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 	private closedByUser = false;
 
 	status: ConnectionStatus = 'idle';
 
 	constructor(url?: string) {
-		this.url =
-			url ?? (typeof location !== 'undefined' ? wsUrl() : 'ws://localhost/realtime');
+		this.url = url ?? (typeof location !== 'undefined' ? wsUrl() : 'ws://localhost/realtime');
 	}
 
 	connect(): void {
-		if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+		if (
+			this.ws &&
+			(this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+		) {
 			return;
 		}
 		this.closedByUser = false;
@@ -50,10 +55,12 @@ export class RealtimeClient {
 			this.backoffIndex = 0;
 			this.setStatus('open');
 			this.send({ t: 'hello', d: { token: '', version: PROTOCOL_VERSION } });
+			this.startHeartbeat();
 		};
 		ws.onmessage = (event) => this.receive(String(event.data));
 		ws.onclose = () => {
 			if (this.ws === ws) this.ws = null;
+			this.stopHeartbeat();
 			this.setStatus('closed');
 			this.failAllPending('connection closed');
 			if (!this.closedByUser) this.scheduleReconnect();
@@ -67,9 +74,42 @@ export class RealtimeClient {
 		this.closedByUser = true;
 		if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
 		this.reconnectTimer = null;
+		this.stopHeartbeat();
 		this.ws?.close();
 		this.ws = null;
 		this.setStatus('closed');
+	}
+
+	/** Keep the server-side connection sweep happy (server drops 30s-silent conns). */
+	private startHeartbeat(): void {
+		this.stopHeartbeat();
+		this.heartbeatTimer = setInterval(() => {
+			this.send({ t: 'ping', d: { ts: Date.now() } });
+		}, HEARTBEAT_MS);
+	}
+
+	private stopHeartbeat(): void {
+		if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+		this.heartbeatTimer = null;
+	}
+
+	/** Resolves when the socket is open (connects if needed), rejects on timeout. */
+	waitForOpen(timeoutMs = OPEN_TIMEOUT_MS): Promise<void> {
+		if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
+		this.connect();
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				off();
+				reject(new Error('not-connected'));
+			}, timeoutMs);
+			const off = this.onStatus((status) => {
+				if (status === 'open') {
+					clearTimeout(timer);
+					off();
+					resolve();
+				}
+			});
+		});
 	}
 
 	private scheduleReconnect(): void {
@@ -94,9 +134,11 @@ export class RealtimeClient {
 	}
 
 	/** Request/ack round trip. Resolves with `ack.d`, rejects on `ack.err`. */
-	request<N extends RequestName>(name: N, payload: RequestPayload<N>): Promise<unknown> {
+	async request<N extends RequestName>(name: N, payload: RequestPayload<N>): Promise<unknown> {
+		await this.waitForOpen();
 		return new Promise((resolve, reject) => {
-			if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+			const ws = this.ws;
+			if (!ws || ws.readyState !== WebSocket.OPEN) {
 				reject(new Error('not-connected'));
 				return;
 			}
@@ -106,7 +148,7 @@ export class RealtimeClient {
 				reject(new Error('request-timeout'));
 			}, REQUEST_TIMEOUT_MS);
 			this.pending.set(id, { resolve, reject, timer });
-			this.ws.send(JSON.stringify({ t: 'req', id, d: { t: name, d: payload } }));
+			ws.send(JSON.stringify({ t: 'req', id, d: { t: name, d: payload } }));
 		});
 	}
 

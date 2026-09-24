@@ -72,8 +72,8 @@ class EchoClientImpl implements EchoClient {
 		this.playersById = new Map(ctx.players.map((p) => [p.id, p]));
 		this.loop = new FixedTimestepLoop({
 			tickRate: ctx.config.tickRate,
-			onTick: (tick) => this.onTick(tick),
-			onRender: (alpha, tick) => this.onRender(alpha, tick)
+			onTick: () => this.onTick(),
+			onRender: (alpha) => this.onRender(alpha)
 		});
 	}
 
@@ -142,7 +142,7 @@ class EchoClientImpl implements EchoClient {
 
 	// ---- fixed tick: sample input, send it, predict locally ----
 
-	private onTick(_tick: number): void {
+	private onTick(): void {
 		this.input.pollGamepads();
 		const frame = this.input.sample();
 		this.ctx.sendInput(frame);
@@ -152,7 +152,7 @@ class EchoClientImpl implements EchoClient {
 
 	// ---- render ----
 
-	private onRender(alpha: number, _tick: number): void {
+	private onRender(alpha: number): void {
 		const now = nowMs();
 		const dt = Math.min(0.1, Math.max(0, (now - this.lastFrameMs) / 1000));
 		this.lastFrameMs = now;

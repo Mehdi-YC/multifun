@@ -1,0 +1,483 @@
+<script lang="ts">
+	import { onMount } from 'svelte';
+	import { goto } from '$app/navigation';
+	import { resolve } from '$app/paths';
+	import GameShell from '$lib/game/GameShell.svelte';
+	import {
+		Avatar,
+		PixelButton,
+		PixelInput,
+		PixelModal,
+		PixelPanel,
+		PixelSelect,
+		PixelToggle,
+		PlayerChip,
+		toast
+	} from '$lib/ui';
+	import {
+		activeMatch,
+		chat,
+		connection,
+		getLobbyId,
+		leaveCurrentLobby,
+		lobby,
+		matchResults,
+		realtime,
+		selfMember
+	} from '$lib/stores/realtime';
+	import { GAME_META } from '$lib/game/meta';
+	import type { AvatarConfig } from '$lib/game/assets/avatar';
+	import type { MemberSnapshot } from '$lib/net/protocol';
+	import type { PageData } from './$types';
+
+	let { data }: { data: PageData } = $props();
+
+	const FALLBACK_AVATAR: AvatarConfig = {
+		version: 1,
+		seed: 0,
+		skin: '#c8d2e8',
+		hair: '#5a5a96',
+		eyes: '#1a1c2c',
+		outfit: '#262647',
+		bg: '#1c1c33',
+		style: 'square',
+		hairStyle: 'bald'
+	};
+
+	const MAX_PLAYER_OPTIONS = ['2', '3', '4', '5', '6', '7', '8'].map((value) => ({
+		value,
+		label: value + ' players'
+	}));
+
+	let joinError = $state<string | null>(null);
+	let draft = $state('');
+	let busy = $state(false);
+	let settingsOpen = $state(false);
+	let settingsName = $state('');
+	let settingsMax = $state('4');
+	let settingsPublic = $state(true);
+
+	const room = $derived($lobby ?? data.lobby);
+	const gameMeta = $derived(GAME_META[room?.gameId ?? 'echo']);
+	const isHost = $derived(!!room && room.hostUserId === data.selfUserId);
+	const me = $derived(room ? selfMember(data.selfUserId, room) : null);
+	const code = $derived(room?.code ?? '');
+	const allReady = $derived(
+		(room?.members ?? []).length > 0 && (room?.members ?? []).every((m) => m.isReady)
+	);
+	const slots = $derived.by(() => {
+		const list: Array<MemberSnapshot | null> = Array.from({ length: 8 }, () => null);
+		for (const member of room?.members ?? []) {
+			if (member.slot >= 0 && member.slot < 8) list[member.slot] = member;
+		}
+		return list;
+	});
+	const ranked = $derived(
+		[...($matchResults?.results ?? [])].sort((a, b) => a.placement - b.placement)
+	);
+
+	onMount(() => {
+		// Seed chat from server history exactly once; the store appends live lines afterwards.
+		const names = new Map((data.lobby?.members ?? []).map((m) => [m.userId, m.displayName]));
+		chat.set(
+			data.messages.map((m) => ({
+				from: m.userId,
+				fromName: names.get(m.userId) ?? '—',
+				text: m.text,
+				ts: m.sentAt
+			}))
+		);
+
+		realtime().connect(); // idempotent — no-op when already connected
+		const target = data.lobby;
+		if (target && getLobbyId() !== target.id) {
+			realtime()
+				.request('lobby.join', { code: target.code })
+				.catch((err: unknown) => {
+					const errCode = err instanceof Error ? err.message : 'error';
+					joinError =
+						errCode === 'lobby-full'
+							? 'That lobby is full — try another one.'
+							: errCode === 'match-in-progress'
+								? 'A match is already running here — wait for it to end.'
+								: 'Could not join this lobby — it may have closed.';
+				});
+		}
+	});
+
+	// keep chat pinned to the newest lines (store subscription, cleaned up on detach)
+	function autoScroll(el: HTMLElement) {
+		return chat.subscribe(() => {
+			el.scrollTop = el.scrollHeight;
+		});
+	}
+
+	function timeLabel(ts: number): string {
+		const d = new Date(ts);
+		const hh = d.getHours().toString().padStart(2, '0');
+		const mm = d.getMinutes().toString().padStart(2, '0');
+		return `${hh}:${mm}`;
+	}
+
+	function avatarOf(userId: string): AvatarConfig {
+		return room?.members.find((m) => m.userId === userId)?.avatarJson ?? FALLBACK_AVATAR;
+	}
+
+	function nameOf(userId: string): string {
+		return (
+			room?.members.find((m) => m.userId === userId)?.displayName ??
+			$activeMatch?.players.find((p) => p.id === userId)?.name ??
+			'Player'
+		);
+	}
+
+	function medalColor(placement: number): string | undefined {
+		if (placement === 1) return '#ffd166';
+		if (placement === 2) return '#c0c0d0';
+		if (placement === 3) return '#c98d61';
+		return undefined;
+	}
+
+	function requestToast(err: unknown, fallback: string): void {
+		const errCode = err instanceof Error ? err.message : 'error';
+		if (errCode === 'not-everyone-ready') toast('Everyone must be ready first!', 'error');
+		else if (errCode === 'not-connected' || errCode === 'connection closed')
+			toast('Connection lost — hang tight.', 'error');
+		else toast(fallback, 'error');
+	}
+
+	function sendChat(event: SubmitEvent) {
+		event.preventDefault();
+		const text = draft.trim().slice(0, 300);
+		if (!text || !room) return;
+		realtime().sendChat(room.id, text);
+		draft = '';
+	}
+
+	async function toggleReady() {
+		if (!room || busy) return;
+		busy = true;
+		try {
+			await realtime().request('lobby.ready', {
+				lobbyId: room.id,
+				ready: !(me?.isReady ?? false)
+			});
+		} catch (err) {
+			requestToast(err, 'Could not update ready state.');
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function startMatch() {
+		if (!room || busy) return;
+		busy = true;
+		try {
+			await realtime().request('lobby.start', { lobbyId: room.id });
+		} catch (err) {
+			requestToast(err, 'Could not start the match.');
+		} finally {
+			busy = false;
+		}
+	}
+
+	async function kick(userId: string) {
+		if (!room) return;
+		try {
+			await realtime().request('lobby.kick', { lobbyId: room.id, userId });
+		} catch (err) {
+			requestToast(err, 'Could not remove that player.');
+		}
+	}
+
+	function openSettings() {
+		if (!room) return;
+		settingsName = room.name;
+		settingsMax = String(room.maxPlayers);
+		// visibility is not part of the snapshot, so the host re-picks it here
+		settingsPublic = true;
+		settingsOpen = true;
+	}
+
+	async function saveSettings(event: SubmitEvent) {
+		event.preventDefault();
+		if (!room) return;
+		try {
+			await realtime().request('lobby.settings', {
+				lobbyId: room.id,
+				name: settingsName.trim() || room.name,
+				maxPlayers: Number(settingsMax),
+				isPublic: settingsPublic
+			});
+			settingsOpen = false;
+			toast('Lobby settings saved.', 'success');
+		} catch (err) {
+			requestToast(err, 'Could not save settings.');
+		}
+	}
+
+	async function copyInvite() {
+		const link = `${location.origin}/lobby/${code}`;
+		try {
+			await navigator.clipboard.writeText(link);
+			toast('Invite link copied — send it to your squad!', 'success');
+		} catch {
+			toast('Could not copy — grab the link from the address bar.', 'error');
+		}
+	}
+
+	function leaveLobby() {
+		leaveCurrentLobby();
+		void goto(resolve('/play/[gameId]', { gameId: gameMeta.id }));
+	}
+</script>
+
+<svelte:head>
+	<title>{room ? `${room.name} — MultiFun` : 'Lobby — MultiFun'}</title>
+</svelte:head>
+
+<!-- connection banner -->
+{#if $connection !== 'open'}
+	<div
+		class="border-b-4 px-4 py-2 text-center font-pixel text-[9px] {$connection === 'closed'
+			? 'border-danger bg-danger/15 text-danger'
+			: 'border-accent bg-accent/10 text-accent'}"
+	>
+		{$connection === 'closed' ? 'Connection lost — reconnecting...' : 'Reconnecting...'}
+	</div>
+{/if}
+
+{#if !room}
+	<div class="mx-auto w-full max-w-md p-8">
+		<PixelPanel title="Lobby not found">
+			<p class="font-body text-sm text-muted">This lobby has closed or never existed.</p>
+			<div class="mt-4">
+				<a href={resolve('/play/echo')} class="font-pixel text-[10px] text-accent underline">
+					Back to games
+				</a>
+			</div>
+		</PixelPanel>
+	</div>
+{:else if joinError}
+	<div class="mx-auto w-full max-w-md p-8">
+		<PixelPanel title="Cannot join">
+			<p class="font-body text-sm text-text">{joinError}</p>
+			<div class="mt-4">
+				<a
+					href={resolve('/play/[gameId]', { gameId: room.gameId })}
+					class="font-pixel text-[10px] text-accent underline"
+				>
+					Back to games
+				</a>
+			</div>
+		</PixelPanel>
+	</div>
+{:else if $activeMatch}
+	<!-- live match: full-width game shell with a slim top bar -->
+	<div class="mx-auto flex w-full max-w-6xl flex-col gap-3 p-4">
+		<div class="pixel-border flex flex-wrap items-center gap-3 bg-surface px-4 py-2">
+			<div class="h-3 w-3" style:background-color={gameMeta.accent}></div>
+			<span class="font-pixel text-[10px] text-text">{room.name}</span>
+			<span class="font-pixel text-[8px] text-muted">
+				PLAYERS ALIVE: {$activeMatch.players.length}
+			</span>
+			<span class="ml-auto font-pixel text-[8px]" style:color={gameMeta.accent}
+				>{gameMeta.title}</span
+			>
+		</div>
+		{#key $activeMatch.matchId}
+			<GameShell match={$activeMatch} selfId={data.selfUserId} />
+		{/key}
+	</div>
+{:else}
+	<div
+		class="mx-auto grid w-full max-w-7xl grid-cols-1 gap-4 p-4 xl:grid-cols-[minmax(0,1fr)_22rem]"
+	>
+		<!-- room stage -->
+		<div class="flex min-w-0 flex-col gap-4">
+			<PixelPanel title={room.name} accent={gameMeta.accent} padded={false}>
+				<div class="h-2 w-full" style:background-color={gameMeta.accent}></div>
+				<div class="flex flex-wrap items-center justify-between gap-2 px-4 py-3">
+					<h2 class="font-pixel text-sm text-text">{gameMeta.title}</h2>
+					<span class="font-pixel text-[8px] text-muted">{gameMeta.tagline}</span>
+				</div>
+			</PixelPanel>
+
+			<!-- player slots -->
+			<PixelPanel title="Players">
+				<div class="grid grid-cols-2 gap-2 md:grid-cols-4">
+					{#each slots as slot, index (slot?.userId ?? 'empty-' + index)}
+						{#if slot}
+							<div class="relative" style:animation="pixel-pop 220ms steps(3)">
+								<PlayerChip member={slot} size={36} />
+								{#if isHost && slot.userId !== data.selfUserId}
+									<button
+										type="button"
+										class="btn-press absolute -top-2 -right-2 h-6 w-6 cursor-pointer border-2 border-danger bg-danger font-pixel text-[8px] text-bg"
+										aria-label="Remove {slot.displayName} from the lobby"
+										onclick={() => kick(slot.userId)}
+									>
+										x
+									</button>
+								{/if}
+							</div>
+						{:else}
+							<div
+								class="flex min-h-16 items-center justify-center border-4 border-dashed border-border px-2 py-3"
+							>
+								<span class="font-pixel text-[8px] text-muted">Waiting...</span>
+							</div>
+						{/if}
+					{/each}
+				</div>
+			</PixelPanel>
+
+			<!-- invite + settings summary -->
+			<PixelPanel title="Invite">
+				<div class="flex flex-wrap items-center gap-3">
+					<span
+						class="border-4 border-border bg-surface-2 px-4 py-2 font-pixel text-lg text-accent"
+					>
+						{code}
+					</span>
+					<PixelButton variant="secondary" onclick={copyInvite}>Copy invite link</PixelButton>
+					<span class="font-body text-xs text-muted">
+						{gameMeta.players} · {gameMeta.title}
+					</span>
+				</div>
+			</PixelPanel>
+
+			<!-- controls bar -->
+			<div class="pixel-border flex flex-wrap items-center gap-3 bg-surface p-4">
+				<PixelButton
+					variant={me?.isReady ? 'ghost' : 'primary'}
+					disabled={busy}
+					onclick={toggleReady}
+				>
+					{me?.isReady ? 'Not ready' : 'Ready up'}
+				</PixelButton>
+
+				{#if isHost}
+					<PixelButton size="lg" disabled={!allReady || busy} onclick={startMatch}>
+						START GAME
+					</PixelButton>
+					<PixelButton variant="secondary" onclick={openSettings}>Settings</PixelButton>
+					{#if !allReady}
+						<span
+							class="font-pixel text-[8px] text-muted"
+							style:animation="blink 1s steps(2) infinite"
+						>
+							WAITING FOR PLAYERS...
+						</span>
+					{/if}
+				{/if}
+
+				<PixelButton variant="danger" onclick={leaveLobby}>Leave lobby</PixelButton>
+			</div>
+		</div>
+
+		<!-- chat sidebar -->
+		<div class="flex min-h-0 flex-col">
+			<PixelPanel title="Chat" padded={false}>
+				<div
+					{@attach autoScroll}
+					class="flex h-80 flex-col gap-2 overflow-y-auto p-3"
+					aria-live="polite"
+				>
+					{#if $chat.length === 0}
+						<p class="font-pixel text-[8px] text-muted">Chat is quiet — say hi!</p>
+					{:else}
+						{#each $chat as line (line.ts + '-' + line.from + '-' + line.text)}
+							<div class="flex items-start gap-2">
+								<Avatar config={avatarOf(line.from)} size={16} alt="" class="mt-0.5" />
+								<div class="min-w-0 flex-1">
+									<p class="flex flex-wrap items-baseline gap-2">
+										<span
+											class="font-pixel text-[8px]"
+											class:text-accent={line.from === data.selfUserId}
+											class:text-info={line.from !== data.selfUserId}
+										>
+											{line.fromName}
+										</span>
+										<span class="font-body text-[10px] text-muted">{timeLabel(line.ts)}</span>
+									</p>
+									<p class="font-body text-sm break-words text-text">{line.text}</p>
+								</div>
+							</div>
+						{/each}
+					{/if}
+				</div>
+				<form class="flex items-end gap-2 border-t-4 border-border p-3" onsubmit={sendChat}>
+					<div class="min-w-0 flex-1">
+						<PixelInput
+							name="chat"
+							placeholder={$connection === 'open' ? 'Say something...' : 'Reconnecting...'}
+							disabled={$connection !== 'open'}
+							bind:value={draft}
+						/>
+					</div>
+					<PixelButton type="submit" disabled={$connection !== 'open' || !draft.trim()}>
+						Send
+					</PixelButton>
+				</form>
+			</PixelPanel>
+		</div>
+	</div>
+{/if}
+
+<!-- host settings modal -->
+<PixelModal title="Lobby settings" bind:open={settingsOpen}>
+	<form class="flex flex-col gap-4" onsubmit={saveSettings}>
+		<PixelInput label="Lobby name" bind:value={settingsName} />
+		<PixelSelect label="Max players" options={MAX_PLAYER_OPTIONS} bind:value={settingsMax} />
+		<PixelToggle label="Public lobby" bind:checked={settingsPublic} />
+		<div class="flex justify-end gap-2">
+			<PixelButton variant="ghost" onclick={() => (settingsOpen = false)}>Cancel</PixelButton>
+			<PixelButton type="submit">Save</PixelButton>
+		</div>
+	</form>
+</PixelModal>
+
+<!-- pixel results screen -->
+{#if $matchResults}
+	<div class="fixed inset-0 z-60 flex items-center justify-center bg-black/80 p-4">
+		<div class="w-full max-w-lg" style:animation="slide-up 200ms steps(3)">
+			<PixelPanel accent="#ffd166">
+				<h2
+					class="mb-4 text-center font-pixel text-2xl text-accent"
+					style:animation="pixel-pop 300ms steps(3)"
+				>
+					RESULTS
+				</h2>
+				<ol class="flex flex-col gap-2">
+					{#each ranked as result (result.player)}
+						<li
+							class="pixel-border flex items-center gap-3 bg-surface-2 px-3 py-2"
+							style:animation="slide-up 200ms steps(3)"
+						>
+							<span
+								class="w-8 text-center font-pixel text-sm"
+								style:color={medalColor(result.placement) ?? 'var(--color-muted)'}
+							>
+								{result.placement}
+							</span>
+							<Avatar config={avatarOf(result.player)} size={32} alt="" />
+							<span class="min-w-0 flex-1 truncate font-pixel text-[10px] text-text">
+								{nameOf(result.player)}
+							</span>
+							<span class="font-pixel text-xs text-accent">{result.score}</span>
+						</li>
+					{/each}
+				</ol>
+				<div class="mt-6 flex flex-wrap justify-center gap-3">
+					<PixelButton variant="ghost" onclick={() => matchResults.set(null)}>
+						Back to lobby
+					</PixelButton>
+					{#if isHost}
+						<PixelButton size="lg" disabled={busy} onclick={startMatch}>Play again</PixelButton>
+					{/if}
+				</div>
+			</PixelPanel>
+		</div>
+	</div>
+{/if}

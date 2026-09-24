@@ -183,13 +183,7 @@ const OUTFIT_COLORS = [
 ];
 const BG_COLORS = ['#262647', '#3b2f4a', '#1f3b4a', '#3a2f2f', '#2c3d2f', '#41335c'];
 const STYLES: AvatarConfig['style'][] = ['square', 'round', 'visor', 'ghost'];
-const HAIR_STYLES: AvatarConfig['hairStyle'][] = [
-	'spiky',
-	'bob',
-	'cap',
-	'bald',
-	'ponytail'
-];
+const HAIR_STYLES: AvatarConfig['hairStyle'][] = ['spiky', 'bob', 'cap', 'bald', 'ponytail'];
 
 /** Deterministic pseudo-random from an integer seed (mulberry32). */
 function mulberry32(seed: number): () => number {

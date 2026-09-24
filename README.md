@@ -3,8 +3,8 @@
 A pixel-art multiplayer game platform: simple profiles, lobbies by join code, and three games
 racing to be fun.
 
-| Game            | Genre                          | Status      |
-| --------------- | ------------------------------ | ----------- |
+| Game              | Genre                          | Status      |
+| ----------------- | ------------------------------ | ----------- |
 | **GeoDash Party** | Multiplayer Geometry Dash-like | In progress |
 | **Turbo Kart**    | Top-down kart racer            | Planned     |
 | **Pixel Brawl**   | Platform fighter               | Planned     |

@@ -5,7 +5,6 @@ import {
 	activeMembers,
 	addMessage,
 	buildLobbySnapshot,
-	demoteFromHost,
 	leaveLobby,
 	promoteHost,
 	setLobbyStatus,
@@ -68,7 +67,8 @@ export class LobbyRoom {
 			this.emptyTimer = null;
 		}
 		await this.refresh();
-		conn.send({ t: 'lobby.state', d: this.state() });
+		// Everyone in the room (including the joiner) needs the new member list.
+		this.broadcast({ t: 'lobby.state', d: this.state() });
 		this.broadcastPresence();
 	}
 
@@ -230,9 +230,10 @@ export class LobbyRoom {
 	state(): LobbySnapshot {
 		return {
 			...this.snapshot,
-			members: this.snapshot.members.map(
-				(m): MemberSnapshot => ({ ...m, connected: this.connected.has(m.userId) })
-			)
+			members: this.snapshot.members.map((m): MemberSnapshot => ({
+				...m,
+				connected: this.connected.has(m.userId)
+			}))
 		};
 	}
 
