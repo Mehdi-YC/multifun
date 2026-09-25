@@ -8,7 +8,7 @@
 
 	let { data }: PageProps = $props();
 
-	const GAME_ORDER: GameId[] = ['geodash', 'kart', 'brawl', 'echo'];
+	const GAME_ORDER: GameId[] = ['tank', 'geodash', 'echo', 'kart', 'brawl'];
 	const games = GAME_ORDER.map((id) => GAME_META[id]);
 
 	const STEPS = [
@@ -25,7 +25,7 @@
 		{
 			n: '3',
 			title: 'Play together',
-			text: 'One lobby, three games. Scores and wins land on your profile.'
+			text: 'One lobby, every game. Scores and wins land on your profile.'
 		}
 	];
 
@@ -45,7 +45,7 @@
 
 <section class="flex flex-col items-start gap-5 py-12">
 	<h1 class="font-pixel text-4xl leading-tight text-text sm:text-6xl">MULTIFUN</h1>
-	<p class="font-pixel text-xs text-muted sm:text-sm">Pixel multiplayer. One lobby. Three games.</p>
+	<p class="font-pixel text-xs text-muted sm:text-sm">Pixel multiplayer. One lobby. Every game.</p>
 	<div class="h-3 w-72 max-w-full bg-accent" style:animation="pixel-pop 300ms steps(3)"></div>
 	<div class="mt-2 flex flex-wrap gap-3">
 		<PixelButton size="lg" onclick={() => goto(resolve('/play/[gameId]', { gameId: 'echo' }))}>

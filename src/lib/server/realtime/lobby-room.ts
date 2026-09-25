@@ -173,7 +173,10 @@ export class LobbyRoom {
 			if (!hasSim(patch.gameId)) throw new Error('game-unavailable');
 			const limits = gameLimits[patch.gameId];
 			if (this.snapshot.members.length > limits.maxPlayers) throw new Error('too-many-players');
-			if (this.snapshot.members.length < limits.minPlayers && patch.gameId !== this.snapshot.gameId) {
+			if (
+				this.snapshot.members.length < limits.minPlayers &&
+				patch.gameId !== this.snapshot.gameId
+			) {
 				// switching TO a game that needs more players is fine (they can invite),
 				// switching when the lobby can never host it is not
 				if (limits.minPlayers > this.snapshot.maxPlayers) throw new Error('too-few-players');

@@ -25,10 +25,11 @@
 		realtime,
 		selfMember
 	} from '$lib/stores/realtime';
-	import { GAME_META } from '$lib/game/meta';
+	import { GAME_META, isGameId } from '$lib/game/meta';
 	import { LEVELS } from '$lib/game/geodash/levels';
 	import { ARENAS } from '$lib/game/tank/arena';
 	import type { AvatarConfig } from '$lib/game/assets/avatar';
+	import type { GameId } from '$lib/game/types';
 	import type { MemberSnapshot } from '$lib/net/protocol';
 	import type { PageData } from './$types';
 
@@ -50,6 +51,10 @@
 		value,
 		label: value + ' players'
 	}));
+
+	// only games with a real sim can be picked for a lobby
+	const PLAYABLE_GAME_IDS: GameId[] = ['echo', 'tank', 'geodash'];
+	const GAME_OPTIONS = PLAYABLE_GAME_IDS.map((id) => ({ value: id, label: GAME_META[id].title }));
 
 	// ---- game-content options (which level / arena the match is played on) ----
 
@@ -114,6 +119,7 @@
 	let busy = $state(false);
 	let settingsOpen = $state(false);
 	let settingsName = $state('');
+	let settingsGame = $state('echo');
 	let settingsMax = $state('4');
 	let settingsPublic = $state(true);
 	let settingsLevel = $state('level-1');
@@ -249,6 +255,10 @@
 		if (errCode === 'not-everyone-ready') toast('Everyone must be ready first!', 'error');
 		else if (errCode === 'not-connected' || errCode === 'connection closed')
 			toast('Connection lost — hang tight.', 'error');
+		else if (errCode === 'game-unavailable') toast('That game is not available yet', 'error');
+		else if (errCode === 'too-many-players')
+			toast('Too many players for that game — remove some first', 'error');
+		else if (errCode === 'too-few-players') toast('This lobby is too small for that game', 'error');
 		else toast(fallback, 'error');
 	}
 
@@ -318,6 +328,7 @@
 	function openSettings() {
 		if (!room) return;
 		settingsName = room.name;
+		settingsGame = room.gameId;
 		settingsMax = String(room.maxPlayers);
 		// visibility is not part of the snapshot, so the host re-picks it here
 		settingsPublic = true;
@@ -330,14 +341,17 @@
 	async function saveSettings(event: SubmitEvent) {
 		event.preventDefault();
 		if (!room) return;
+		// the select only offers playable game ids, so this always narrows
+		const gameId: GameId = isGameId(settingsGame) ? settingsGame : room.gameId;
 		// preserve any other stored keys and persist the game-content selection
 		const settings: Record<string, unknown> = { ...room.settings };
-		if (room.gameId === 'geodash') settings.levelId = settingsLevel;
-		else if (room.gameId === 'tank') settings.arenaId = settingsArena;
+		if (gameId === 'geodash') settings.levelId = settingsLevel;
+		else if (gameId === 'tank') settings.arenaId = settingsArena;
 		try {
 			await realtime().request('lobby.settings', {
 				lobbyId: room.id,
 				name: settingsName.trim() || room.name,
+				gameId,
 				maxPlayers: Number(settingsMax),
 				isPublic: settingsPublic,
 				settings
@@ -568,9 +582,10 @@
 <PixelModal title="Lobby settings" bind:open={settingsOpen}>
 	<form class="flex flex-col gap-4" onsubmit={saveSettings}>
 		<PixelInput label="Lobby name" bind:value={settingsName} />
-		{#if room?.gameId === 'geodash'}
+		<PixelSelect label="Game" options={GAME_OPTIONS} bind:value={settingsGame} />
+		{#if settingsGame === 'geodash'}
 			<PixelSelect label="Level" options={levelOptions} bind:value={settingsLevel} />
-		{:else if room?.gameId === 'tank'}
+		{:else if settingsGame === 'tank'}
 			<PixelSelect label="Arena" options={arenaOptions} bind:value={settingsArena} />
 		{/if}
 		<PixelSelect label="Max players" options={MAX_PLAYER_OPTIONS} bind:value={settingsMax} />
