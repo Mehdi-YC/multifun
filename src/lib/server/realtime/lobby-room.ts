@@ -19,6 +19,8 @@ const EMPTY_CLOSE_MS = 60_000;
 export interface LobbyRoomDeps {
 	/** Create the match + game room and broadcast `game.start`. Throws on failure. */
 	launchMatch(snapshot: LobbySnapshot): Promise<void>;
+	/** Lobby deleted while a match runs — stop and abort it. */
+	abortMatch(lobbyId: string): void;
 	destroyRoom(lobbyId: string): void;
 }
 
@@ -80,7 +82,9 @@ export class LobbyRoom {
 		conn.rooms.delete(this.lobbyId);
 		if (this.graceTimers.has(conn.userId)) return;
 		const timer = setTimeout(() => {
-			void this.expireMember(conn.userId);
+			void this.expireMember(conn.userId).catch((err) =>
+				console.error('[lobby-room] expireMember failed (non-fatal)', err)
+			);
 		}, DISCONNECT_GRACE_MS);
 		this.graceTimers.set(conn.userId, timer);
 		this.broadcastPresence();
@@ -122,7 +126,10 @@ export class LobbyRoom {
 	private scheduleEmptyClose(): void {
 		if (this.emptyTimer) return;
 		this.emptyTimer = setTimeout(() => {
-			if (this.conns.size === 0) void this.close();
+			if (this.conns.size === 0)
+				void this.close().catch((err) =>
+					console.error('[lobby-room] close failed (non-fatal)', err)
+				);
 		}, EMPTY_CLOSE_MS);
 	}
 
@@ -207,7 +214,11 @@ export class LobbyRoom {
 	/** Host-only: close the lobby for everyone and remove it from listings. */
 	async deleteLobby(conn: Connection): Promise<void> {
 		if (conn.userId !== this.snapshot.hostUserId) throw new Error('not-host');
-		if (this.matchRunning) throw new Error('match-running');
+		// deleting mid-match aborts the match instead of leaving a zombie running
+		if (this.matchRunning) {
+			this.matchRunning = false;
+			this.deps.abortMatch(this.lobbyId);
+		}
 		for (const m of this.snapshot.members) {
 			await leaveLobby(this.lobbyId, m.userId);
 		}

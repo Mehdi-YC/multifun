@@ -28,6 +28,7 @@
 	import { GAME_META, isGameId } from '$lib/game/meta';
 	import { LEVELS } from '$lib/game/geodash/levels';
 	import { ARENAS } from '$lib/game/tank/arena';
+	import { TRACKS } from '$lib/game/kart/track';
 	import type { AvatarConfig } from '$lib/game/assets/avatar';
 	import type { GameId } from '$lib/game/types';
 	import type { MemberSnapshot } from '$lib/net/protocol';
@@ -53,7 +54,7 @@
 	}));
 
 	// only games with a real sim can be picked for a lobby
-	const PLAYABLE_GAME_IDS: GameId[] = ['echo', 'tank', 'geodash'];
+	const PLAYABLE_GAME_IDS: GameId[] = ['echo', 'tank', 'geodash', 'kart'];
 	const GAME_OPTIONS = PLAYABLE_GAME_IDS.map((id) => ({ value: id, label: GAME_META[id].title }));
 
 	// ---- game-content options (which level / arena the match is played on) ----
@@ -114,6 +115,19 @@
 		})
 	);
 
+	const trackOptions = TRACKS.map((track) => ({ value: track.id, label: track.name }));
+
+	const aiCountOptions = ['0', '1', '2', '3', '4', '5', '6', '7'].map((value) => ({
+		value,
+		label: value + ' players'
+	}));
+
+	const aiDifficultyOptions = [
+		{ value: 'easy', label: 'Easy' },
+		{ value: 'medium', label: 'Medium' },
+		{ value: 'hard', label: 'Hard' }
+	];
+
 	let joinError = $state<string | null>(null);
 	let draft = $state('');
 	let busy = $state(false);
@@ -124,6 +138,9 @@
 	let settingsPublic = $state(true);
 	let settingsLevel = $state('level-1');
 	let settingsArena = $state('crossfire');
+	let settingsTrack = $state('sunny-circuit');
+	let settingsAiCount = $state('0');
+	let settingsAiDifficulty = $state('medium');
 	let deleteOpen = $state(false);
 
 	const room = $derived($lobby ?? data.lobby);
@@ -144,8 +161,9 @@
 	const ranked = $derived(
 		[...($matchResults?.results ?? [])].sort((a, b) => a.placement - b.placement)
 	);
-	// Read-only label for the settings summary line: which level / arena this
-	// lobby is set to play (resolved through LEVELS / ARENAS for its name).
+	// Read-only label for the settings summary line: which level / arena / track
+	// this lobby is set to play (resolved through LEVELS / ARENAS / TRACKS for
+	// its name).
 	const matchContentLabel = $derived.by(() => {
 		if (!room) return '';
 		if (room.gameId === 'geodash') {
@@ -157,6 +175,11 @@
 			const id = settingString(room.settings, 'arenaId') || 'crossfire';
 			const arena = ARENAS.map(asRecord).find((entry) => String(entry.id ?? '') === id);
 			return String(arena?.name || prettifyId(id));
+		}
+		if (room.gameId === 'kart') {
+			const id = settingString(room.settings, 'trackId') || 'sunny-circuit';
+			const track = TRACKS.find((entry) => entry.id === id);
+			return track?.name || prettifyId(id);
 		}
 		return '';
 	});
@@ -335,6 +358,18 @@
 		// prefill the game-content selection from the room's saved settings
 		settingsLevel = pickOption(settingString(room.settings, 'levelId'), 'level-1', levelOptions);
 		settingsArena = pickOption(settingString(room.settings, 'arenaId'), 'crossfire', arenaOptions);
+		settingsTrack = pickOption(
+			settingString(room.settings, 'trackId'),
+			'sunny-circuit',
+			trackOptions
+		);
+		// aiCount may arrive as a number, so stringify before validating the option
+		settingsAiCount = pickOption(String(room.settings.aiCount ?? ''), '0', aiCountOptions);
+		settingsAiDifficulty = pickOption(
+			settingString(room.settings, 'aiDifficulty'),
+			'medium',
+			aiDifficultyOptions
+		);
 		settingsOpen = true;
 	}
 
@@ -347,6 +382,11 @@
 		const settings: Record<string, unknown> = { ...room.settings };
 		if (gameId === 'geodash') settings.levelId = settingsLevel;
 		else if (gameId === 'tank') settings.arenaId = settingsArena;
+		else if (gameId === 'kart') {
+			settings.trackId = settingsTrack;
+			settings.aiCount = Number(settingsAiCount);
+			settings.aiDifficulty = settingsAiDifficulty;
+		}
 		try {
 			await realtime().request('lobby.settings', {
 				lobbyId: room.id,
@@ -587,6 +627,14 @@
 			<PixelSelect label="Level" options={levelOptions} bind:value={settingsLevel} />
 		{:else if settingsGame === 'tank'}
 			<PixelSelect label="Arena" options={arenaOptions} bind:value={settingsArena} />
+		{:else if settingsGame === 'kart'}
+			<PixelSelect label="Track" options={trackOptions} bind:value={settingsTrack} />
+			<PixelSelect label="CPU racers" options={aiCountOptions} bind:value={settingsAiCount} />
+			<PixelSelect
+				label="CPU difficulty"
+				options={aiDifficultyOptions}
+				bind:value={settingsAiDifficulty}
+			/>
 		{/if}
 		<PixelSelect label="Max players" options={MAX_PLAYER_OPTIONS} bind:value={settingsMax} />
 		<PixelToggle label="Public lobby" bind:checked={settingsPublic} />

@@ -47,4 +47,8 @@ console.log('Test data reset:');
 for (const [table, n] of Object.entries(counts)) {
 	console.log(`  ${table}: ${n} row(s) deleted`);
 }
+console.log(
+	'\nNote: run this while no matches are in progress — wiping rows under a live\n' +
+		'match makes its end-of-match writes fail (the server logs and survives).'
+);
 db.close();

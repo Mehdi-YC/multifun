@@ -690,6 +690,13 @@ Notes from building Phase 0 (keep updated per milestone):
   and a zero-allocation render/interp path. **Follow-up (protocol-level):** input-ack in snapshots
   (last applied input tick) would let clients reconcile precisely and remove the workaround;
   `PixelCanvas.text()` should cache uppercase strings.
+- **A server crash from an unhandled rejection:** a match still running when `db:reset-test-data`
+  wiped its rows died on an FK violation in the end-of-match writes — and `void asyncFn()` timer
+  callbacks + no process-level handler turned that into a full crash. Now: match persistence is
+  best-effort (try/catch, loud log), lobby deletion **aborts** a running match instead of leaving a
+  zombie, fire-and-forget timers are caught, and `getRealtimeServer()` installs an
+  `unhandledRejection` net so no stray async error can take the box down. Repro'd live: DB wiped
+  under a running match → match ends, server stays up; mid-match lobby delete → clean abort.
 - **Turbo Kart shipped** (plan §8): drift tiers (blue/orange/purple mini-turbos), hop-drift,
   pads/ramps/tricks/slipstream, soft walls + auto-respawn, items (mushroom/oil/missile/shield/
   lightning) weighted to trailers, 3 spline tracks (Sunny Circuit / Neon Dojo / Frostbite Falls —

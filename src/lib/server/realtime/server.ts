@@ -59,6 +59,8 @@ export class RealtimeServer {
 	private readonly byUser = new Map<string, Set<Connection>>();
 	private readonly lobbyRooms = new Map<string, LobbyRoom>();
 	private readonly gameRooms = new Map<string, GameRoom>();
+	/** lobbyId → running matchId, so lobby deletion can abort the match. */
+	private readonly gameByLobby = new Map<string, string>();
 	private heartbeat: ReturnType<typeof setInterval> | null = null;
 	private started = false;
 
@@ -342,6 +344,7 @@ export class RealtimeServer {
 	private roomDeps() {
 		return {
 			launchMatch: (snapshot: LobbySnapshot) => this.launchMatch(snapshot),
+			abortMatch: (lobbyId: string) => this.abortMatch(lobbyId),
 			destroyRoom: (lobbyId: string) => this.lobbyRooms.delete(lobbyId)
 		};
 	}
@@ -380,6 +383,7 @@ export class RealtimeServer {
 			onEnd: (results) => void this.handleMatchEnd(lobby, matchId, results)
 		});
 		this.gameRooms.set(matchId, gameRoom);
+		this.gameByLobby.set(lobby.id, matchId);
 		const startAt = Date.now() + MATCH_START_DELAY_MS;
 		room.broadcast({
 			t: 'game.start',
@@ -406,22 +410,47 @@ export class RealtimeServer {
 		results: MatchResult[]
 	): Promise<void> {
 		this.gameRooms.delete(matchId);
-		await finishMatch(matchId, results, 'finished');
-		for (const r of results) {
-			await upsertBestScore({
-				gameId: lobby.gameId,
-				userId: r.player,
-				mode: 'casual',
-				key: 'global',
-				value: r.score,
-				higherIsBetter: true
-			});
+		this.gameByLobby.delete(lobby.id);
+		// Persistence must never take the server down: rows may be gone (manual
+		// DB resets, cascading deletes) and an unhandled rejection here used to
+		// crash the whole process.
+		try {
+			await finishMatch(matchId, results, 'finished');
+			for (const r of results) {
+				await upsertBestScore({
+					gameId: lobby.gameId,
+					userId: r.player,
+					mode: 'casual',
+					key: 'global',
+					value: r.score,
+					higherIsBetter: true
+				});
+			}
+		} catch (err) {
+			console.error('[realtime] match persistence failed (non-fatal)', err);
 		}
 		const room = this.lobbyRooms.get(lobby.id);
 		if (room) {
 			room.broadcast({ t: 'game.end', d: { matchId, results } });
-			await room.matchEnded();
+			try {
+				await room.matchEnded();
+			} catch (err) {
+				console.error('[realtime] lobby reset after match failed (non-fatal)', err);
+			}
 		}
+	}
+
+	/** Host deleted the lobby mid-match: stop the sim and record an abort. */
+	private abortMatch(lobbyId: string): void {
+		const matchId = this.gameByLobby.get(lobbyId);
+		if (!matchId) return;
+		this.gameByLobby.delete(lobbyId);
+		const gameRoom = this.gameRooms.get(matchId);
+		this.gameRooms.delete(matchId);
+		gameRoom?.stop();
+		void finishMatch(matchId, [], 'aborted').catch((err) =>
+			console.error('[realtime] match abort persistence failed (non-fatal)', err)
+		);
 	}
 }
 
@@ -460,6 +489,14 @@ function humanError(code: string): string {
 let instance: RealtimeServer | null = null;
 
 export function getRealtimeServer(): RealtimeServer {
-	if (!instance) instance = new RealtimeServer();
+	if (!instance) {
+		// Safety net: an unhandled rejection anywhere in the realtime stack used
+		// to take the whole server down (e.g. DB writes racing a manual reset).
+		// Log loudly and keep serving.
+		process.on('unhandledRejection', (reason) => {
+			console.error('[realtime] unhandled rejection (server kept alive)', reason);
+		});
+		instance = new RealtimeServer();
+	}
 	return instance;
 }
