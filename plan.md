@@ -659,3 +659,11 @@ Notes from building Phase 0 (keep updated per milestone):
   `config.options` (e.g. `levelId`, `arenaId`).
 - **GameEvent/`GameId` growth:** new games extend the `GameId` union — every `Record<GameId, …>`
   (registry, meta, limits, configs, UI maps) must gain a key or `svelte-check` flags it.
+- **"Sometimes no bg" was 4 bugs:** unpainted PixelCanvas letterbox bars (transparent → page shows
+  through; only visible off-16:9), stale backing store before the first `resize()`, NaN sizes
+  corrupting the transform, and GeoDash sky bands leaving rows uncovered as the camera panned.
+  `PixelCanvas` now paints a letterbox matte, re-fits defensively, and takes an optional dpr.
+- **GeoDash transformations shipped** (plan §7.1 forms): portals switch cube/ship/ball — ship =
+  hold-JUMP thrust, ball = tap-JUMP flips gravity; `transform` events on the wire; 6 levels with a
+  mode-aware beatability bot (0-deaths first attempts). Level/arena pickers in the lobby settings
+  modal make all content reachable from the UI.
