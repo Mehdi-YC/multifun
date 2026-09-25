@@ -107,6 +107,7 @@ export async function updateLobbySettings(
 	lobbyId: string,
 	patch: {
 		name?: string;
+		gameId?: string;
 		maxPlayers?: number;
 		isPublic?: boolean;
 		settings?: Record<string, unknown>;
@@ -114,6 +115,7 @@ export async function updateLobbySettings(
 ): Promise<void> {
 	const values: Partial<typeof lobby.$inferInsert> = {};
 	if (patch.name !== undefined) values.name = patch.name;
+	if (patch.gameId !== undefined) values.gameId = patch.gameId;
 	if (patch.maxPlayers !== undefined) values.maxPlayers = patch.maxPlayers;
 	if (patch.isPublic !== undefined) values.isPublic = patch.isPublic;
 	if (patch.settings !== undefined) values.settingsJson = JSON.stringify(patch.settings);

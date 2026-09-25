@@ -159,6 +159,7 @@ export const requestPayloads = {
 	'lobby.settings': z.object({
 		lobbyId: z.string(),
 		name: z.string().min(1).max(32).optional(),
+		gameId: gameIdSchema.optional(),
 		maxPlayers: z.number().int().min(2).max(8).optional(),
 		isPublic: z.boolean().optional(),
 		settings: z.record(z.string(), z.unknown()).optional()

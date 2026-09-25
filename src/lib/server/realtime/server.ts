@@ -306,6 +306,7 @@ export class RealtimeServer {
 				if (!room) throw new Error('not-in-lobby');
 				await room.updateSettings(conn, {
 					name: p.name,
+					gameId: p.gameId,
 					maxPlayers: p.maxPlayers,
 					isPublic: p.isPublic,
 					settings: p.settings
@@ -447,6 +448,8 @@ function humanError(code: string): string {
 		'not-in-lobby': 'You are not in that lobby',
 		'username-taken': 'That username is taken',
 		'game-unavailable': 'That game is not available yet',
+		'too-many-players': 'Too many players for that game — remove some first',
+		'too-few-players': 'That lobby is too small for that game',
 		'cannot-kick-self': 'You cannot kick yourself',
 		'rate-limited': 'Slow down a bit!',
 		'unknown-request': 'Unknown request'

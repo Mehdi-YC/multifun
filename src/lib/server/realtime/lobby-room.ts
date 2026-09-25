@@ -1,6 +1,7 @@
 import type { Connection } from './connection';
 import type { LobbySnapshot, MemberSnapshot, ServerMessage } from '$lib/net/protocol';
-import type { MatchResult } from '$lib/game/types';
+import type { GameId, MatchResult } from '$lib/game/types';
+import { gameLimits, hasSim } from './sim-registry';
 import {
 	activeMembers,
 	addMessage,
@@ -161,12 +162,23 @@ export class LobbyRoom {
 		conn: Connection,
 		patch: {
 			name?: string;
+			gameId?: GameId;
 			maxPlayers?: number;
 			isPublic?: boolean;
 			settings?: Record<string, unknown>;
 		}
 	): Promise<void> {
 		if (conn.userId !== this.snapshot.hostUserId) throw new Error('not-host');
+		if (patch.gameId !== undefined) {
+			if (!hasSim(patch.gameId)) throw new Error('game-unavailable');
+			const limits = gameLimits[patch.gameId];
+			if (this.snapshot.members.length > limits.maxPlayers) throw new Error('too-many-players');
+			if (this.snapshot.members.length < limits.minPlayers && patch.gameId !== this.snapshot.gameId) {
+				// switching TO a game that needs more players is fine (they can invite),
+				// switching when the lobby can never host it is not
+				if (limits.minPlayers > this.snapshot.maxPlayers) throw new Error('too-few-players');
+			}
+		}
 		await updateLobbySettings(this.lobbyId, patch);
 		await this.refresh();
 		this.broadcast({ t: 'lobby.state', d: this.state() });
