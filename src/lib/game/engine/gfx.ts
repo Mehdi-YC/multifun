@@ -122,6 +122,12 @@ export interface PixelCanvasOptions {
 	/** Fixed internal resolution (default 480x270). */
 	width?: number;
 	height?: number;
+	/**
+	 * Letterbox matte painted around the internal viewport by `clear()`.
+	 * Defaults to the `clear()` color itself (so the bars blend with the
+	 * game background); set it to a palette-derived color for a framed look.
+	 */
+	letterbox?: string | null;
 }
 
 export class PixelCanvas {
@@ -135,6 +141,16 @@ export class PixelCanvas {
 	offsetX = 0;
 	offsetY = 0;
 
+	/**
+	 * Letterbox matte color for `clear()`. `null` = use the clear color (or
+	 * leave the bars transparent when `clear()` gets no color at all).
+	 */
+	letterbox: string | null;
+
+	/** Backing-store size it was last fitted to (catches external resizes). */
+	private fittedW: number;
+	private fittedH: number;
+
 	constructor(canvas: CanvasSourceLike, options: PixelCanvasOptions = {}) {
 		const ctx = canvas.getContext('2d');
 		if (!ctx) throw new Error('PixelCanvas: 2d context unavailable');
@@ -142,35 +158,77 @@ export class PixelCanvas {
 		this.ctx = ctx;
 		this.width = options.width ?? 480;
 		this.height = options.height ?? 270;
+		this.letterbox = options.letterbox ?? null;
+		this.fittedW = Math.max(1, Math.floor(canvas.width) || 1);
+		this.fittedH = Math.max(1, Math.floor(canvas.height) || 1);
+		this.derive(this.fittedW, this.fittedH);
 	}
 
 	/**
 	 * Fit the fixed internal resolution into `cssWidth x cssHeight` using the
 	 * largest integer scale that fits, centered with letterboxing. The caller
-	 * owns CSS sizing; pass device-pixel-ratio-adjusted sizes if desired.
+	 * owns CSS sizing.
+	 *
+	 * `dpr` is an explicit device-pixel-ratio multiplier (default 1: callers
+	 * that pass CSS pixels keep a 1:1 backing store). Pass
+	 * `window.devicePixelRatio` for crisp rendering on HiDPI screens. Invalid
+	 * sizes (0, negative, NaN, Infinity) or an invalid `dpr` never corrupt the
+	 * canvas: the last good backing store is kept and re-derived.
 	 */
-	resize(cssWidth: number, cssHeight: number): void {
-		const w = Math.max(1, Math.round(cssWidth));
-		const h = Math.max(1, Math.round(cssHeight));
-		this.canvas.width = w;
-		this.canvas.height = h;
+	resize(cssWidth: number, cssHeight: number, dpr = 1): void {
+		const ratio = Number.isFinite(dpr) && dpr > 0 ? dpr : 1;
+		const w = Number.isFinite(cssWidth) && cssWidth > 0 ? Math.round(cssWidth * ratio) : 0;
+		const h = Number.isFinite(cssHeight) && cssHeight > 0 ? Math.round(cssHeight * ratio) : 0;
+		const nextW = w > 0 ? w : this.fittedW;
+		const nextH = h > 0 ? h : this.fittedH;
+		this.canvas.width = nextW;
+		this.canvas.height = nextH;
+		this.fittedW = nextW;
+		this.fittedH = nextH;
+		this.derive(nextW, nextH);
+	}
+
+	/** Re-derive integer scale + letterbox offsets for a backing-store size. */
+	private derive(w: number, h: number): void {
 		this.scale = Math.max(1, Math.floor(Math.min(w / this.width, h / this.height)));
 		this.offsetX = Math.floor((w - this.width * this.scale) / 2);
 		this.offsetY = Math.floor((h - this.height * this.scale) / 2);
 	}
 
+	/** Re-fit when something else resized the backing store underneath us. */
+	private sync(): void {
+		const w = Math.max(1, Math.floor(this.canvas.width) || 1);
+		const h = Math.max(1, Math.floor(this.canvas.height) || 1);
+		if (w !== this.fittedW || h !== this.fittedH) {
+			this.fittedW = w;
+			this.fittedH = h;
+			this.derive(w, h);
+		}
+	}
+
 	/** Reset the transform so draws land in internal resolution coordinates. */
 	begin(): void {
+		this.sync();
 		this.ctx.setTransform(this.scale, 0, 0, this.scale, this.offsetX, this.offsetY);
 		this.ctx.imageSmoothingEnabled = false;
 	}
 
-	/** Clear the whole backing store (letterbox included) and begin drawing. */
+	/**
+	 * Clear and paint the ENTIRE backing store — letterbox bars included —
+	 * then begin drawing. The matte is `letterbox ?? color`; the internal
+	 * viewport gets `color`. With neither, the store is cleared to transparent.
+	 */
 	clear(color?: string): void {
+		this.sync();
 		this.ctx.setTransform(1, 0, 0, 1, 0, 0);
 		this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+		const matte = this.letterbox ?? color;
+		if (matte !== undefined) {
+			this.ctx.fillStyle = matte;
+			this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+		}
 		this.begin();
-		if (color !== undefined) {
+		if (color !== undefined && color !== matte) {
 			this.ctx.fillStyle = color;
 			this.ctx.fillRect(0, 0, this.width, this.height);
 		}

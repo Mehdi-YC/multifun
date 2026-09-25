@@ -26,8 +26,8 @@ import { InputManager } from '../engine/input';
 import { FixedTimestepLoop } from '../engine/loop';
 import { ParticleSystem } from '../engine/particles';
 import { TweenManager, easeOutQuad } from '../engine/tween';
-import { CUBE_SIZE, blockSize, padRect } from './level-types';
-import type { GeoDashLevel } from './level-types';
+import { CUBE_SIZE, blockSize, padRect, portalGate } from './level-types';
+import type { GeoDashLevel, GeoDashMode } from './level-types';
 import {
 	COUNTDOWN_TICKS,
 	createGeodashSim,
@@ -158,8 +158,49 @@ function beatPulse(tick: number, bpm: number): number {
 	return Math.sin((tick * bpm * Math.PI * 2) / 3600);
 }
 
-type RemotePoint = { x: number; y: number; vy: number; onGround: boolean };
+/**
+ * Draw the sky gradient in SCREEN space so it covers every row of the
+ * viewport (0..VIEW_H) for any camera position. `shift` slides the gradient
+ * with the camera; band rects are clamped to the viewport and the band list
+ * is extended past both edges so no row is ever left uncovered.
+ */
+export function drawSkyBands(
+	fill: (x: number, y: number, w: number, h: number, color: string) => void,
+	sky: string[],
+	cameraY: number
+): void {
+	const bands = Math.max(1, sky.length);
+	const bandH = Math.ceil(VIEW_H / bands);
+	const shift = Math.round(cameraY * 0.06);
+	// Start at (or above) the band covering row 0, run past row VIEW_H.
+	const first = Math.floor(-shift / bandH) - 1;
+	for (let i = first; i < first + bands + 2; i++) {
+		const top = i * bandH + shift;
+		const y0 = Math.max(0, top);
+		const y1 = Math.min(VIEW_H, top + bandH + 1);
+		if (y1 <= y0) continue;
+		const color = sky[Math.min(bands - 1, Math.max(0, i))];
+		fill(0, y0, VIEW_W, y1 - y0, color);
+	}
+}
+
+type RemotePoint = {
+	x: number;
+	y: number;
+	vy: number;
+	onGround: boolean;
+	mode: GeoDashMode;
+	thrusting: boolean;
+};
 type RemoteSample = { tick: number; points: Map<PlayerId, RemotePoint> };
+
+/** What the sprite renderer needs to know about a player. */
+type PlayerDrawInfo = {
+	vy: number;
+	onGround: boolean;
+	mode: GeoDashMode;
+	thrusting: boolean;
+};
 
 export interface GeoDashClient extends GameClient {
 	/** Fit the canvas backing store (internal resolution stays 480x270). */
@@ -187,10 +228,13 @@ class GeoDashClientImpl implements GeoDashClient {
 
 	private readonly remoteSamples: RemoteSample[] = [];
 	private readonly rotations = new Map<PlayerId, number>();
+	private resizeApplied = false;
 	private lastFrameMs = nowMs();
 
 	// juice state
 	private deathFlash = 0;
+	private transformFlash = 0;
+	private transformColor = '#ffffff';
 	private splashText = '';
 	private splashAlpha = 0;
 	private bestPercent = 0;
@@ -206,6 +250,9 @@ class GeoDashClientImpl implements GeoDashClient {
 		this.sim = createGeodashSim(ctx.seed, ctx.config, ctx.players);
 		this.level = this.sim.level;
 		this.palette = paletteForDifficulty(this.level.difficulty);
+		// Letterbox bars get the darkest sky tone so they always read as part
+		// of the scene instead of showing the page through.
+		this.pixel.letterbox = this.palette.sky[0];
 		this.playersById = new Map(ctx.players.map((p) => [p.id, p]));
 		this.particles = new ParticleSystem({ capacity: 256 });
 		this.camera = new Camera({ width: VIEW_W, height: VIEW_H, smoothing: 6, lookAhead: 0 });
@@ -237,7 +284,9 @@ class GeoDashClientImpl implements GeoDashClient {
 	}
 
 	resize(cssWidth: number, cssHeight: number): void {
-		this.pixel.resize(cssWidth, cssHeight);
+		this.resizeApplied = true;
+		const dpr = typeof globalThis.devicePixelRatio === 'number' ? globalThis.devicePixelRatio : 1;
+		this.pixel.resize(cssWidth, cssHeight, dpr);
 	}
 
 	/** Server snapshots carry every player; we interpolate the remote ones. */
@@ -246,7 +295,14 @@ class GeoDashClientImpl implements GeoDashClient {
 		if (!snap) return;
 		const points = new Map<PlayerId, RemotePoint>();
 		for (const p of snap.players) {
-			points.set(p.id, { x: p.x, y: p.y, vy: p.vy, onGround: p.onGround });
+			points.set(p.id, {
+				x: p.x,
+				y: p.y,
+				vy: p.vy,
+				onGround: p.onGround,
+				mode: p.mode,
+				thrusting: (p.lastKeys & KEY.JUMP) !== 0
+			});
 		}
 		this.remoteSamples.push({ tick: snap.tick, points });
 		if (this.remoteSamples.length > MAX_REMOTE_SAMPLES) this.remoteSamples.shift();
@@ -272,6 +328,11 @@ class GeoDashClientImpl implements GeoDashClient {
 			case 'boost':
 				if (ev.player === self) return;
 				this.audio.sfx.boost();
+				break;
+			case 'transform':
+				if (ev.player === self) return;
+				this.audio.sfx.boost();
+				this.burstAtRemote(ev.player, this.modeColor(ev.mode));
 				break;
 			default:
 				break;
@@ -340,6 +401,21 @@ class GeoDashClientImpl implements GeoDashClient {
 				this.audio.sfx.boost();
 				this.camera.addTrauma(0.2);
 				break;
+			case 'transform': {
+				this.audio.sfx.boost();
+				this.camera.addTrauma(0.15);
+				this.transformFlash = 3;
+				this.transformColor = this.modeColor(ev.mode);
+				const self = this.selfState();
+				this.particles.emit({
+					kind: 'ring',
+					x: (self?.x ?? 0) + HALF_CUBE,
+					y: (self?.y ?? 0) + HALF_CUBE,
+					color: this.transformColor,
+					size: 42
+				});
+				break;
+			}
 			case 'collect':
 				this.audio.sfx.jump();
 				this.particles.emit({
@@ -365,9 +441,21 @@ class GeoDashClientImpl implements GeoDashClient {
 		return this.sim.players.find((p) => p.id === this.ctx.selfId);
 	}
 
+	/** Per-form portal/flame accent color. */
+	private modeColor(mode: GeoDashMode): string {
+		if (mode === 'ship') return '#6ec6ff';
+		if (mode === 'ball') return '#ffd166';
+		return this.palette.portal;
+	}
+
 	// ---- render ----
 
 	private onRender(alpha: number): void {
+		// If the shell never got a ResizeObserver callback before the first
+		// frame (container not laid out yet), fit to the backing store now.
+		if (!this.resizeApplied) {
+			this.pixel.resize(this.pixel.canvas.width, this.pixel.canvas.height, 1);
+		}
 		const now = nowMs();
 		const dt = Math.min(0.1, Math.max(0, (now - this.lastFrameMs) / 1000));
 		this.lastFrameMs = now;
@@ -376,9 +464,10 @@ class GeoDashClientImpl implements GeoDashClient {
 
 		const self = this.selfState();
 		if (self) {
-			// Camera holds the cube at ~35% from the left, gentle vertical follow.
+			// Camera holds the cube at ~35% from the left, gentle vertical
+			// follow with enough range to see ship corridors and ball ceilings.
 			const targetX = self.x + HALF_CUBE + VIEW_W * 0.15;
-			const targetY = Math.max(-80, Math.min(60, (self.y + HALF_CUBE) * 0.35));
+			const targetY = Math.max(-115, Math.min(65, (self.y + HALF_CUBE) * 0.5));
 			this.camera.follow(targetX, targetY, dt, self.speedMult * 8.5, self.vy);
 		}
 
@@ -398,6 +487,13 @@ class GeoDashClientImpl implements GeoDashClient {
 		this.drawSpeedLines();
 		this.drawHud();
 		this.drawCountdown();
+		if (this.transformFlash > 0) {
+			// Portal-entry flash: a tinted veil that fades over 3 frames.
+			pixel.ctx.globalAlpha = 0.18 * this.transformFlash;
+			pixel.fillRect(0, 0, VIEW_W, VIEW_H, this.transformColor);
+			pixel.ctx.globalAlpha = 1;
+			this.transformFlash--;
+		}
 		if (this.deathFlash > 0) {
 			pixel.ctx.globalAlpha = 0.75;
 			pixel.fillRect(0, 0, VIEW_W, VIEW_H, '#ffffff');
@@ -411,11 +507,8 @@ class GeoDashClientImpl implements GeoDashClient {
 	private drawSky(pulse: number): void {
 		const pixel = this.pixel;
 		const sky = this.palette.sky;
-		const bandH = Math.ceil(VIEW_H / sky.length);
-		const shift = Math.round(this.camera.y * 0.06);
-		for (let i = 0; i < sky.length; i++) {
-			pixel.fillRect(0, i * bandH + shift, VIEW_W, bandH + 1, sky[i]);
-		}
+		// Screen-space bands: full coverage of every viewport row at any camera y.
+		drawSkyBands((x, y, w, h, color) => pixel.fillRect(x, y, w, h, color), sky, this.camera.y);
 		// pulsing glow rings on the beat
 		const glow = this.palette.glow;
 		for (let i = 0; i < 3; i++) {
@@ -504,6 +597,9 @@ class GeoDashClientImpl implements GeoDashClient {
 				case 'gravity':
 					this.drawPortal(obj.x, obj.y, obj.type === 'gravity');
 					break;
+				case 'portal':
+					this.drawModePortal(obj.x, obj.mode);
+					break;
 				default:
 					break;
 			}
@@ -540,10 +636,10 @@ class GeoDashClientImpl implements GeoDashClient {
 		const pixel = this.pixel;
 		const w = 40;
 		const h = 40;
-		// stacked rows make a crisp triangle; two tones + bright tip
+		// stacked rows make a crisp triangle; two tones + bright tip.
+		// flip = hanging spike pointing DOWN (narrow at the bottom).
 		for (let row = 0; row < h; row += 2) {
-			const t = flip ? 1 - row / h : row / h;
-			const half = (w / 2) * (1 - t);
+			const half = (w / 2) * (1 - row / h);
 			const ry = flip ? y + row : y + h - row - 2;
 			pixel.fillRect(x + w / 2 - half, ry, half * 2, 2, this.palette.spike);
 			pixel.fillRect(x + w / 2 - half, ry, half, 2, this.palette.spikeDark);
@@ -607,6 +703,35 @@ class GeoDashClientImpl implements GeoDashClient {
 		pixel.ctx.globalAlpha = 1;
 	}
 
+	/** Mode portal: shimmering gate with a form glyph (cube / rocket / ball). */
+	private drawModePortal(x: number, mode: GeoDashMode): void {
+		const pixel = this.pixel;
+		const color = this.modeColor(mode);
+		const gate = portalGate({ x });
+		pixel.fillRect(gate.x, gate.y, 3, gate.h, color);
+		pixel.fillRect(gate.x + gate.w - 3, gate.y, 3, gate.h, color);
+		for (let sy = gate.y + 4; sy < gate.y + gate.h - 4; sy += 12) {
+			const shimmer = (sy + this.sim.tick * 3) % 24 < 12 ? 0.3 : 0.12;
+			pixel.ctx.globalAlpha = shimmer;
+			pixel.fillRect(gate.x + 3, sy, gate.w - 6, 8, color);
+		}
+		pixel.ctx.globalAlpha = 1;
+		// Form glyph at mid-height, so the player can read the portal early.
+		const gx = x + 4;
+		const gy = gate.y + gate.h / 2;
+		if (mode === 'cube') {
+			pixel.fillRect(gx - 8, gy - 8, 16, 16, color);
+			pixel.fillRect(gx - 5, gy - 5, 10, 10, '#1a1c2c');
+		} else if (mode === 'ship') {
+			pixel.fillRect(gx - 4, gy - 10, 8, 16, color);
+			pixel.fillRect(gx - 8, gy + 2, 16, 6, color);
+			pixel.fillRect(gx - 2, gy - 14, 4, 4, '#ffffff');
+		} else {
+			pixel.circle(gx, gy, 9, color, true);
+			pixel.circle(gx, gy, 4, '#1a1c2c', true);
+		}
+	}
+
 	private drawFinish(x: number): void {
 		const pixel = this.pixel;
 		for (let row = 0; row < 14; row++) {
@@ -657,13 +782,19 @@ class GeoDashClientImpl implements GeoDashClient {
 			if (player.id === this.ctx.selfId) continue;
 			const pos = this.remotePos(player.id, renderTick);
 			if (!pos) continue;
-			this.drawCube(pos.x, pos.y, player, pos.vy, pos.onGround, GHOST_ALPHA, player.name);
+			this.drawPlayer(pos.x, pos.y, player, pos, GHOST_ALPHA, player.name);
 		}
 		const self = this.selfState();
 		if (self) {
 			const meta = this.playersById.get(this.ctx.selfId);
 			if (meta) {
-				this.drawCube(self.x, self.y, meta, self.vy, self.onGround, 1, null);
+				const info: PlayerDrawInfo = {
+					vy: self.vy,
+					onGround: self.onGround,
+					mode: self.mode,
+					thrusting: (self.lastKeys & KEY.JUMP) !== 0
+				};
+				this.drawPlayer(self.x, self.y, meta, info, 1, null);
 				this.particles.emit({
 					kind: 'trail',
 					x: self.x - 2,
@@ -689,14 +820,34 @@ class GeoDashClientImpl implements GeoDashClient {
 		}
 	}
 
+	private drawPlayer(
+		x: number,
+		y: number,
+		player: SimPlayer,
+		info: PlayerDrawInfo,
+		alpha: number,
+		name: string | null
+	): void {
+		if (info.mode === 'ship') this.drawShip(x, y, player, info.vy, info.thrusting, alpha);
+		else if (info.mode === 'ball') this.drawBall(x, y, player, alpha);
+		else this.drawCube(x, y, player, info.vy, info.onGround, alpha);
+
+		if (name) {
+			const cx = x + HALF_CUBE;
+			const label = name.toUpperCase().slice(0, 8);
+			this.pixel.ctx.globalAlpha = alpha;
+			this.pixel.text(label, cx - this.pixel.textWidth(label, 1) / 2, y - 12, '#ffffff', 1);
+			this.pixel.ctx.globalAlpha = 1;
+		}
+	}
+
 	private drawCube(
 		x: number,
 		y: number,
 		player: SimPlayer,
 		vy: number,
 		onGround: boolean,
-		alpha: number,
-		name: string | null
+		alpha: number
 	): void {
 		const pixel = this.pixel;
 		const cx = x + HALF_CUBE;
@@ -725,13 +876,70 @@ class GeoDashClientImpl implements GeoDashClient {
 		pixel.fillRect(4, -4, 2, 2, '#ffffff');
 		pixel.fillRect(-5, 5, 10, 2, '#1a1c2c');
 		pixel.ctx.restore();
+	}
 
-		if (name) {
-			const label = name.toUpperCase().slice(0, 8);
-			pixel.ctx.globalAlpha = alpha;
-			pixel.text(label, cx - pixel.textWidth(label, 1) / 2, y - 12, '#ffffff', 1);
-			pixel.ctx.globalAlpha = 1;
+	/** Ship: little rocket, nose tilted toward vertical velocity, thrust flame. */
+	private drawShip(
+		x: number,
+		y: number,
+		player: SimPlayer,
+		vy: number,
+		thrusting: boolean,
+		alpha: number
+	): void {
+		const pixel = this.pixel;
+		const cx = x + HALF_CUBE;
+		const cy = y + HALF_CUBE;
+		const angle = Math.max(-0.5, Math.min(0.5, vy * 0.055));
+
+		pixel.ctx.save();
+		pixel.ctx.globalAlpha = alpha;
+		pixel.ctx.translate(cx, cy);
+		pixel.ctx.rotate(angle);
+		// hull
+		pixel.fillRect(-13, -6, 26, 12, player.color);
+		pixel.fillRect(-13, -6, 26, 3, shade(player.color, 42));
+		pixel.fillRect(-13, 3, 26, 3, shade(player.color, -42));
+		// nose cone + tip
+		pixel.fillRect(13, -4, 5, 8, shade(player.color, 30));
+		pixel.fillRect(18, -2, 3, 4, '#ffffff');
+		// fins
+		pixel.fillRect(-11, -10, 8, 4, shade(player.color, -25));
+		pixel.fillRect(-11, 6, 8, 4, shade(player.color, -25));
+		// cockpit
+		pixel.fillRect(1, -5, 7, 6, '#1a1c2c');
+		pixel.fillRect(2, -4, 3, 2, '#ffffff');
+		if (thrusting) {
+			// deterministic flame flicker
+			const flick = this.sim.tick % 3;
+			pixel.fillRect(-22 - flick, -3, 9 + flick * 2, 6, '#ffd166');
+			pixel.fillRect(-18 - flick, -2, 5 + flick, 4, '#ff8a3a');
+			pixel.fillRect(-15, -1, 4, 2, '#fff6d8');
 		}
+		pixel.ctx.restore();
+	}
+
+	/** Ball: rolling orb with a spin cross + face. */
+	private drawBall(x: number, y: number, player: SimPlayer, alpha: number): void {
+		const pixel = this.pixel;
+		const cx = x + HALF_CUBE;
+		const cy = y + HALF_CUBE;
+		const spin = x * 0.075;
+
+		pixel.ctx.save();
+		pixel.ctx.globalAlpha = alpha;
+		pixel.ctx.translate(cx, cy);
+		pixel.circle(0, 0, 15, player.color, true);
+		pixel.ctx.rotate(spin);
+		pixel.fillRect(-3, -13, 6, 26, shade(player.color, -35));
+		pixel.fillRect(-13, -3, 26, 6, shade(player.color, -35));
+		pixel.ctx.rotate(-spin);
+		pixel.circle(-5, -6, 4, shade(player.color, 45), true);
+		pixel.fillRect(-8, -1, 3, 4, '#1a1c2c');
+		pixel.fillRect(4, -1, 3, 4, '#1a1c2c');
+		pixel.fillRect(-7, 0, 1, 1, '#ffffff');
+		pixel.fillRect(5, 0, 1, 1, '#ffffff');
+		pixel.ctx.restore();
 	}
 
 	// ---- screen-space juice + HUD ----
@@ -867,7 +1075,9 @@ class GeoDashClientImpl implements GeoDashClient {
 			x: a.x + (b.x - a.x) * t,
 			y: a.y + (b.y - a.y) * t,
 			vy: b.vy,
-			onGround: b.onGround
+			onGround: b.onGround,
+			mode: b.mode,
+			thrusting: b.thrusting
 		};
 	}
 }

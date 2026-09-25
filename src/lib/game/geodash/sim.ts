@@ -1,9 +1,18 @@
 /**
- * GeoDash Party — deterministic cube-mode simulation.
+ * GeoDash Party — deterministic multi-form simulation.
  *
  * COORDINATE CONVENTION (see level-types.ts): y grows downward, the ground
  * surface is y = 0, the air is y < 0. Player state (x, y) is the TOP-LEFT
- * corner of the 30x30 cube, so a grounded cube sits at y = -30.
+ * corner of the 30x30 hitbox, so a grounded cube sits at y = -30.
+ *
+ * FORMS (switched by `portal` objects, reset to 'cube' on death):
+ * - cube: jump arcs, hold-jump auto re-jump, pads + orbs.
+ * - ship: hold KEY.JUMP to thrust up against gravity, |vy| clamped (no
+ *   flipping); lands/slides on top of blocks and under ceilings, dies on
+ *   face-first side collisions. Ignores pads and orbs.
+ * - ball: tapping KEY.JUMP while pressed against a surface flips the gravity
+ *   direction; rolls along whatever surface it is pressed against. Pads and
+ *   speed portals apply; orbs are cube-only.
  *
  * Per tick, per player: auto-run right at BASE_SPEED * speedMult, jump on
  * KEY.JUMP (hold = auto re-jump on landing), jump buffer 4 ticks, coyote time
@@ -32,7 +41,7 @@ import {
 	spikeHitbox,
 	blockSize
 } from './level-types';
-import type { GeoDashLevel, GeoDashObject } from './level-types';
+import type { GeoDashLevel, GeoDashMode, GeoDashObject } from './level-types';
 import { getLevel } from './levels';
 
 // ---- tuning (fixed 60Hz tick) ----
@@ -49,6 +58,14 @@ export const COUNTDOWN_TICKS = 180;
 export const FALL_Y = 260;
 /** Player y (top) above this = flew out of the world ('fall'). */
 export const CEIL_Y = -520;
+
+// ship form: hold JUMP to thrust up, gravity pulls down, speed clamped.
+export const SHIP_THRUST = 0.9;
+export const SHIP_GRAVITY = 0.45;
+export const SHIP_MAX_VY = 8;
+
+// ball form: tapping JUMP on a surface flips gravity with a small kick.
+export const BALL_FLIP_VELOCITY = 3.5;
 
 const TAU = Math.PI * 2;
 
@@ -96,13 +113,13 @@ class SimRng {
 
 export type GeoDashPlayerState = {
 	id: PlayerId;
-	/** Top-left corner of the 30x30 cube. */
+	/** Top-left corner of the 30x30 hitbox. */
 	x: number;
 	y: number;
 	vy: number;
-	/** Only 'cube' for now (ship/wave/ball later). */
-	mode: 'cube';
-	/** +1 = normal gravity, -1 = flipped (portals later). */
+	/** Current form (switched by mode portals, reset to 'cube' on death). */
+	mode: GeoDashMode;
+	/** +1 = normal gravity, -1 = flipped (ball form flips it). */
 	gravityDir: 1 | -1;
 	speedMult: number;
 	onGround: boolean;
@@ -120,6 +137,8 @@ export type GeoDashPlayerState = {
 	orbUsed: number;
 	/** Bitmask of speed portals already crossed. */
 	portalUsed: number;
+	/** Bitmask of mode portals already crossed. */
+	modeUsed: number;
 	/** Last input keys (disconnected players keep their last input). */
 	lastKeys: number;
 	/** Cosmetic idle-animation phase drawn from the seeded rng. */
@@ -146,6 +165,11 @@ function readNumber(source: Record<string, unknown>, key: string): number {
 	return typeof v === 'number' && Number.isFinite(v) ? v : 0;
 }
 
+function readMode(source: Record<string, unknown>): GeoDashMode {
+	const v = source['mode'];
+	return v === 'ship' || v === 'ball' ? v : 'cube';
+}
+
 /** Parse an untyped snapshot (e.g. from the wire). Null when malformed. */
 export function parseGeoDashSnapshot(state: GameStatePatch): GeoDashSnapshot | null {
 	const tick = state['tick'];
@@ -162,7 +186,7 @@ export function parseGeoDashSnapshot(state: GameStatePatch): GeoDashSnapshot | n
 			x: readNumber(p, 'x'),
 			y: readNumber(p, 'y'),
 			vy: readNumber(p, 'vy'),
-			mode: 'cube',
+			mode: readMode(p),
 			gravityDir: p['gravityDir'] === -1 ? -1 : 1,
 			speedMult: readNumber(p, 'speedMult') || 1,
 			onGround: p['onGround'] === true,
@@ -176,6 +200,7 @@ export function parseGeoDashSnapshot(state: GameStatePatch): GeoDashSnapshot | n
 			finishTimeMs: readNumber(p, 'finishTimeMs'),
 			orbUsed: readNumber(p, 'orbUsed'),
 			portalUsed: readNumber(p, 'portalUsed'),
+			modeUsed: readNumber(p, 'modeUsed'),
 			lastKeys: readNumber(p, 'lastKeys'),
 			phase: readNumber(p, 'phase')
 		});
@@ -215,6 +240,8 @@ type OrbBody = { x: number; y: number; box: Rect; index: number };
 
 type PortalBody = { x: number; mult: number; index: number };
 
+type ModePortalBody = { x: number; mode: GeoDashMode; index: number };
+
 function overlaps(a: Rect, b: Rect): boolean {
 	return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
 }
@@ -230,6 +257,7 @@ class GeoDashSimulation implements GameSim {
 	private readonly pads: PadBody[] = [];
 	private readonly orbs: OrbBody[] = [];
 	private readonly portals: PortalBody[] = [];
+	private readonly modePortals: ModePortalBody[] = [];
 
 	private readonly rng = new SimRng(0);
 	private readonly durationTicks: number;
@@ -246,6 +274,7 @@ class GeoDashSimulation implements GameSim {
 
 		let orbIndex = 0;
 		let portalIndex = 0;
+		let modePortalIndex = 0;
 		for (const obj of this.level.objects as GeoDashObject[]) {
 			switch (obj.type) {
 				case 'block': {
@@ -267,6 +296,9 @@ class GeoDashSimulation implements GameSim {
 					break;
 				case 'speed':
 					this.portals.push({ x: obj.x, mult: obj.mult, index: portalIndex++ });
+					break;
+				case 'portal':
+					this.modePortals.push({ x: obj.x, mode: obj.mode, index: modePortalIndex++ });
 					break;
 				default:
 					break;
@@ -294,6 +326,7 @@ class GeoDashSimulation implements GameSim {
 				finishTimeMs: 0,
 				orbUsed: 0,
 				portalUsed: 0,
+				modeUsed: 0,
 				lastKeys: 0,
 				phase: 0
 			};
@@ -411,6 +444,7 @@ class GeoDashSimulation implements GameSim {
 			h = fnvInt(h, quantize(p.phase));
 			h = fnvInt(h, p.orbUsed);
 			h = fnvInt(h, p.portalUsed);
+			h = fnvInt(h, p.modeUsed);
 			h = fnvInt(h, p.attempts);
 			h = fnvInt(h, p.deaths);
 			h = fnvInt(h, p.coyote);
@@ -420,6 +454,7 @@ class GeoDashSimulation implements GameSim {
 			h = fnvByte(h, p.onGround ? 1 : 0);
 			h = fnvByte(h, p.finished ? 1 : 0);
 			h = fnvByte(h, p.gravityDir === -1 ? 1 : 0);
+			h = fnvByte(h, p.mode === 'cube' ? 0 : p.mode === 'ship' ? 1 : 2);
 		}
 		return h >>> 0;
 	}
@@ -431,31 +466,50 @@ class GeoDashSimulation implements GameSim {
 		const jumpPressed = jumpHeld && (p.lastKeys & KEY.JUMP) === 0;
 		if (jumpPressed) p.jumpBuffer = JUMP_BUFFER_TICKS;
 
-		// Jump intent: ground/coyote jump (hold = auto re-jump), else an orb.
-		if (p.onGround || p.coyote > 0) {
-			if (jumpHeld || p.jumpBuffer > 0) {
-				p.vy = JUMP_VELOCITY * p.gravityDir;
+		// Per-form vertical intent (evaluated before gravity integrates).
+		if (p.mode === 'cube') {
+			// Jump intent: ground/coyote jump (hold = auto re-jump), else an orb.
+			if (p.onGround || p.coyote > 0) {
+				if (jumpHeld || p.jumpBuffer > 0) {
+					p.vy = JUMP_VELOCITY * p.gravityDir;
+					p.onGround = false;
+					p.coyote = 0;
+					p.jumpBuffer = 0;
+				}
+			} else if (jumpPressed || p.jumpBuffer > 0) {
+				const orb = this.orbUnder(p);
+				if (orb) {
+					p.vy = JUMP_VELOCITY * p.gravityDir;
+					p.jumpBuffer = 0;
+					p.orbUsed |= 1 << orb.index;
+					this.events.push({ kind: 'collect', player: p.id, item: 'orb' });
+				}
+			}
+		} else if (p.mode === 'ball') {
+			// Tap (edge, not hold) while pressed against a surface: flip gravity.
+			if (p.onGround && (jumpPressed || p.jumpBuffer > 0)) {
+				p.gravityDir = p.gravityDir === 1 ? -1 : 1;
+				p.vy = BALL_FLIP_VELOCITY * p.gravityDir;
 				p.onGround = false;
 				p.coyote = 0;
 				p.jumpBuffer = 0;
 			}
-		} else if (jumpPressed || p.jumpBuffer > 0) {
-			const orb = this.orbUnder(p);
-			if (orb) {
-				p.vy = JUMP_VELOCITY * p.gravityDir;
-				p.jumpBuffer = 0;
-				p.orbUsed |= 1 << orb.index;
-				this.events.push({ kind: 'collect', player: p.id, item: 'orb' });
-			}
 		}
 
 		const wasOnGround = p.onGround;
-		p.vy += GRAVITY * p.gravityDir;
-		if (p.vy > MAX_FALL_SPEED) p.vy = MAX_FALL_SPEED;
-		if (p.vy < -MAX_FALL_SPEED) p.vy = -MAX_FALL_SPEED;
+		if (p.mode === 'ship') {
+			// Hold JUMP to thrust against gravity; clamped vertical speed.
+			p.vy += (jumpHeld ? -SHIP_THRUST : SHIP_GRAVITY) * p.gravityDir;
+			if (p.vy > SHIP_MAX_VY) p.vy = SHIP_MAX_VY;
+			if (p.vy < -SHIP_MAX_VY) p.vy = -SHIP_MAX_VY;
+		} else {
+			p.vy += GRAVITY * p.gravityDir;
+			if (p.vy > MAX_FALL_SPEED) p.vy = MAX_FALL_SPEED;
+			if (p.vy < -MAX_FALL_SPEED) p.vy = -MAX_FALL_SPEED;
+		}
 		const beforeY = p.y;
 
-		// Auto-run right; speed portals flip the multiplier at their x.
+		// Auto-run right; speed + mode portals trigger at their x plane.
 		p.x += BASE_SPEED * p.speedMult;
 		for (const portal of this.portals) {
 			const bit = 1 << portal.index;
@@ -463,6 +517,18 @@ class GeoDashSimulation implements GameSim {
 				p.portalUsed |= bit;
 				p.speedMult = portal.mult;
 				this.events.push({ kind: 'boost', player: p.id, power: portal.mult });
+			}
+		}
+		for (const portal of this.modePortals) {
+			const bit = 1 << portal.index;
+			if (p.x >= portal.x && (p.modeUsed & bit) === 0) {
+				p.modeUsed |= bit;
+				p.mode = portal.mode;
+				if (p.mode === 'ship') {
+					if (p.vy > SHIP_MAX_VY) p.vy = SHIP_MAX_VY;
+					if (p.vy < -SHIP_MAX_VY) p.vy = -SHIP_MAX_VY;
+				}
+				this.events.push({ kind: 'transform', player: p.id, mode: portal.mode });
 			}
 		}
 
@@ -495,7 +561,7 @@ class GeoDashSimulation implements GameSim {
 				p.onGround = true;
 				// Buffered or held jump fires the instant the cube touches
 				// down (the jump buffer stays valid 4 ticks before landing).
-				if (jumpHeld || p.jumpBuffer > 0) {
+				if (p.mode === 'cube' && (jumpHeld || p.jumpBuffer > 0)) {
 					p.vy = JUMP_VELOCITY * p.gravityDir;
 					p.onGround = false;
 					p.coyote = 0;
@@ -504,8 +570,11 @@ class GeoDashSimulation implements GameSim {
 					p.vy = 0;
 				}
 			} else {
+				// Pressed against the underside of a block: grounded too (the
+				// ball needs this to flip gravity while ceiling-rolling).
 				p.y = landing.y + landing.h;
 				p.vy = 0;
+				p.onGround = true;
 			}
 		}
 		// Walked off a ledge without jumping: grace ticks (set, don't also decay).
@@ -513,7 +582,8 @@ class GeoDashSimulation implements GameSim {
 		else if (p.coyote > 0 && !p.onGround) p.coyote--;
 
 		// Pads launch on contact (after landing, so a pad on the floor fires).
-		if (p.warmup <= 0) {
+		// The ship ignores pads: it flies.
+		if (p.warmup <= 0 && p.mode !== 'ship') {
 			const box = { x: p.x, y: p.y, w: CUBE_SIZE, h: CUBE_SIZE };
 			for (const pad of this.pads) {
 				if (overlaps(box, pad)) {
@@ -583,6 +653,7 @@ class GeoDashSimulation implements GameSim {
 		p.x = 0;
 		p.y = -CUBE_SIZE;
 		p.vy = 0;
+		p.mode = 'cube';
 		p.onGround = true;
 		p.coyote = 0;
 		p.jumpBuffer = 0;
@@ -590,6 +661,7 @@ class GeoDashSimulation implements GameSim {
 		p.gravityDir = 1;
 		p.orbUsed = 0;
 		p.portalUsed = 0;
+		p.modeUsed = 0;
 		p.warmup = RESPAWN_WARMUP_TICKS;
 		p.phase = this.rng.next() * TAU;
 		this.events.push({ kind: 'respawn', player: p.id });

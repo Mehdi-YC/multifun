@@ -1,11 +1,12 @@
 /**
- * GeoDash Party — multiplayer Geometry Dash-like race. Cube mode only for
- * now (ship/wave/ball land later); 2-8 players run the same auto-runner level
- * simultaneously, dying and respawning, first to the finish wins.
+ * GeoDash Party — multiplayer Geometry Dash-like race. Cube, ship and ball
+ * forms (switched by mode portals in the level); 2-8 players run the same
+ * auto-runner level simultaneously, dying and respawning, first to the finish
+ * wins.
  *
  * `config.options` consumed by the sim/client:
  * - `mode`: 'race' (default, the only mode for now)
- * - `levelId`: 'level-1' | 'level-2' | 'level-3' (default 'level-1')
+ * - `levelId`: 'level-1' ... 'level-6' (default 'level-1')
  * - `level`: full GeoDashLevel override (validated; beats `levelId` — used by
  *   tests and, later, the level editor)
  * - `countdownTicks`: shared 3/2/1/GO freeze length (default 180 = 3s)

@@ -50,6 +50,37 @@ describe('geodash level parser', () => {
 		expect(result.ok, result.ok ? '' : result.errors.join('; ')).toBe(true);
 	});
 
+	it('accepts mode portals with each form', () => {
+		const result = parseGeoDashLevel(
+			baseLevel({
+				lengthPx: 4000,
+				objects: [
+					{ type: 'block', x: 0, y: 0, w: 4000, h: 80 },
+					{ type: 'portal', x: 500, mode: 'ship' },
+					{ type: 'portal', x: 1500, mode: 'ball' },
+					{ type: 'portal', x: 2500, mode: 'cube' }
+				]
+			})
+		);
+		expect(result.ok, result.ok ? '' : result.errors.join('; ')).toBe(true);
+	});
+
+	it('rejects malformed mode portals', () => {
+		const cases: unknown[] = [
+			{ type: 'portal', x: 500 },
+			{ type: 'portal', x: 500, mode: 'wave' },
+			{ type: 'portal', x: 500, mode: 3 },
+			{ type: 'portal', x: 500, mode: 'ship', y: -140 },
+			{ type: 'portal', mode: 'ship' }
+		];
+		for (const obj of cases) {
+			const result = parseGeoDashLevel(
+				baseLevel({ objects: [{ type: 'block', x: 0, y: 0, w: 1000, h: 80 }, obj] })
+			);
+			expect(result.ok, JSON.stringify(obj)).toBe(false);
+		}
+	});
+
 	it('rejects non-objects and null', () => {
 		for (const bad of [null, undefined, 42, 'level', [], true]) {
 			const result = parseGeoDashLevel(bad);
@@ -162,6 +193,43 @@ describe('geodash level semantic validation', () => {
 		const errors = validateGeoDashLevel(level).join(' ');
 		expect(errors).toMatch(/pad power/);
 		expect(errors).toMatch(/speed mult/);
+	});
+
+	it('accepts mode portals in open air', () => {
+		const level = clean();
+		level.objects.push({ type: 'portal', x: 950, mode: 'ship' });
+		expect(validateGeoDashLevel(level)).toEqual([]);
+	});
+
+	it('rejects mode portals whose gate overlaps a solid', () => {
+		const level = clean();
+		// A wall in the air at the portal's x: the gate column is blocked.
+		level.objects.push({ type: 'block', x: 900, y: -80, w: 80, h: 80 });
+		level.objects.push({ type: 'portal', x: 950, mode: 'ship' });
+		expect(validateGeoDashLevel(level).join(' ')).toMatch(/portal gate overlaps a solid/);
+	});
+
+	it('rejects mode portals that are unordered or crammed together', () => {
+		const level = clean();
+		level.lengthPx = 2000;
+		level.objects.push({ type: 'portal', x: 950, mode: 'ship' });
+		level.objects.push({ type: 'portal', x: 960, mode: 'ball' });
+		expect(validateGeoDashLevel(level).join(' ')).toMatch(/too close/);
+
+		const backwards = clean();
+		backwards.lengthPx = 2000;
+		backwards.objects.push({ type: 'portal', x: 950, mode: 'ship' });
+		backwards.objects.push({ type: 'orb', x: 700, y: -100 });
+		expect(validateGeoDashLevel(backwards).join(' ')).toMatch(/backwards/);
+	});
+
+	it('rejects too many mode portals for the usage bitmask', () => {
+		const level = clean();
+		level.lengthPx = 4000;
+		for (let i = 0; i < 33; i++) {
+			level.objects.push({ type: 'portal', x: 1000 + i * 80, mode: i % 2 === 0 ? 'ship' : 'ball' });
+		}
+		expect(validateGeoDashLevel(level).join(' ')).toMatch(/mode portals \(max 32\)/);
 	});
 });
 

@@ -7,8 +7,14 @@
 import { describe, expect, it } from 'vitest';
 import type { GameConfig, InputFrame, PlayerId, SimPlayer } from '../types';
 import { KEY } from '../types';
-import type { GeoDashLevel, GeoDashObject } from './level-types';
-import { createGeodashSim, parseGeoDashSnapshot, type GeoDashSim } from './sim';
+import type { GeoDashLevel, GeoDashObject, GeoDashMode } from './level-types';
+import {
+	createGeodashSim,
+	parseGeoDashSnapshot,
+	BALL_FLIP_VELOCITY,
+	SHIP_MAX_VY,
+	type GeoDashSim
+} from './sim';
 
 const PLAYERS: SimPlayer[] = [
 	{ id: 'p1', name: 'Ada', color: '#ff5c7a', slot: 0 },
@@ -498,5 +504,314 @@ describe('geodash countdown and match lifecycle', () => {
 		}
 		expect(heldAirborne).toBeGreaterThan(idleAirborne + 30);
 		expect(player(held).deaths).toBe(0);
+	});
+});
+
+// ---- forms: ship ----
+
+/** Tall corridor (floor + ceiling) with a ship portal right at the start. */
+function shipLevel(): GeoDashLevel {
+	return testLevel(
+		[
+			{ type: 'block', x: 0, y: -560, w: 3000, h: 80 },
+			{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+			{ type: 'portal', x: 10, mode: 'ship' }
+		],
+		2500
+	);
+}
+
+function becomeShip(sim: GeoDashSim): void {
+	for (let t = 0; t < 3; t++) sim.tickOnce(mapOf(['p1', frame(0)]));
+	sim.drainEvents();
+	expect(player(sim).mode).toBe('ship');
+}
+
+describe('geodash ship form', () => {
+	const cfg = config({ durationTicks: 400 }, { level: shipLevel() });
+
+	it('hold JUMP thrusts up and clamps at SHIP_MAX_VY; release falls and clamps down', () => {
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		becomeShip(sim);
+
+		let sawClampUp = false;
+		let maxAbsVy = 0;
+		let minY = 0;
+		for (let t = 0; t < 25; t++) {
+			sim.tickOnce(mapOf(['p1', frame(KEY.JUMP)]));
+			const p = player(sim);
+			if (p.vy === -SHIP_MAX_VY) sawClampUp = true;
+			maxAbsVy = Math.max(maxAbsVy, Math.abs(p.vy));
+			minY = Math.min(minY, p.y);
+		}
+		expect(sawClampUp).toBe(true);
+		expect(minY).toBeLessThan(-90); // clearly climbed
+
+		let sawClampDown = false;
+		for (let t = 0; t < 60; t++) {
+			sim.tickOnce(mapOf(['p1', frame(0)]));
+			const p = player(sim);
+			if (p.vy === SHIP_MAX_VY) sawClampDown = true;
+			maxAbsVy = Math.max(maxAbsVy, Math.abs(p.vy));
+			if (p.onGround) break;
+		}
+		expect(sawClampDown).toBe(true);
+		expect(maxAbsVy).toBeLessThanOrEqual(SHIP_MAX_VY); // never flips past the clamp
+		expect(player(sim).deaths).toBe(0);
+	});
+
+	it('a short tap barely lifts the ship; a sustained hold climbs hard', () => {
+		const fly = (keys: (t: number) => number): number => {
+			const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+			becomeShip(sim);
+			let minY = 0;
+			for (let t = 0; t < 35; t++) {
+				sim.tickOnce(mapOf(['p1', frame(keys(t))]));
+				minY = Math.min(minY, player(sim).y);
+			}
+			return minY;
+		};
+		const tapY = fly((t) => (t === 0 || t === 1 ? KEY.JUMP : 0));
+		const holdY = fly((t) => (t < 30 ? KEY.JUMP : 0));
+		expect(holdY).toBeLessThan(tapY - 60);
+	});
+
+	it('lands on top of a block and slides along; side hits still kill', () => {
+		// A low mound mid-corridor: fly over its edge and settle on its top.
+		const level = testLevel(
+			[
+				{ type: 'block', x: 0, y: -560, w: 3000, h: 80 },
+				{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+				{ type: 'portal', x: 10, mode: 'ship' },
+				{ type: 'block', x: 200, y: -40, w: 800, h: 40 }
+			],
+			2500
+		);
+		const sim = createGeodashSim(1, config({ durationTicks: 300 }, { level }), [PLAYERS[0]]);
+		becomeShip(sim);
+		let landedY = 0;
+		let landedX = 0;
+		for (let t = 0; t < 80; t++) {
+			// climb over the mound's leading edge, then coast down onto its top
+			sim.tickOnce(mapOf(['p1', frame(t < 12 ? KEY.JUMP : 0)]));
+			const p = player(sim);
+			if (p.onGround && p.x > 300) {
+				landedY = p.y;
+				landedX = p.x;
+				break;
+			}
+		}
+		expect(landedY).toBe(-70); // top of the mound (-40) minus the 30px hitbox
+		expect(landedX).toBeGreaterThan(300);
+		expect(player(sim).deaths).toBe(0);
+
+		// Same mound with no thrust: the ship rams its side and dies.
+		const crash = createGeodashSim(1, config({ durationTicks: 300 }, { level }), [PLAYERS[0]]);
+		becomeShip(crash);
+		const { deathCauses } = driveTicks(crash, 80, () => 0);
+		expect(deathCauses[0]).toBe('block');
+	});
+});
+
+// ---- forms: ball ----
+
+/** Floor + rollable ceiling with a ball portal right at the start. */
+function ballLevel(): GeoDashLevel {
+	return testLevel(
+		[
+			{ type: 'block', x: 0, y: -240, w: 3000, h: 40 },
+			{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+			{ type: 'portal', x: 10, mode: 'ball' }
+		],
+		2500
+	);
+}
+
+function becomeBall(sim: GeoDashSim): void {
+	for (let t = 0; t < 3; t++) sim.tickOnce(mapOf(['p1', frame(0)]));
+	sim.drainEvents();
+	expect(player(sim).mode).toBe('ball');
+}
+
+describe('geodash ball form', () => {
+	const cfg = config({ durationTicks: 400 }, { level: ballLevel() });
+
+	it('tapping JUMP on the ground flips gravity and rolls to the ceiling', () => {
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		becomeBall(sim);
+		expect(player(sim).gravityDir).toBe(1);
+
+		sim.tickOnce(mapOf(['p1', frame(KEY.JUMP)]));
+		sim.drainEvents();
+		const flipped = player(sim);
+		expect(flipped.gravityDir).toBe(-1);
+		expect(flipped.vy).toBeLessThan(0);
+		expect(flipped.vy).toBeCloseTo(BALL_FLIP_VELOCITY * -1 - 0.8, 5);
+
+		// rises to the ceiling (underside at y = -200) and presses against it
+		for (let t = 0; t < 40; t++) sim.tickOnce(mapOf(['p1', frame(0)]));
+		const onCeiling = player(sim);
+		expect(onCeiling.onGround).toBe(true);
+		expect(onCeiling.y).toBe(-200);
+		expect(onCeiling.gravityDir).toBe(-1);
+
+		// tap again: flips back down to the floor
+		sim.tickOnce(mapOf(['p1', frame(KEY.JUMP)]));
+		expect(player(sim).gravityDir).toBe(1);
+		for (let t = 0; t < 40; t++) sim.tickOnce(mapOf(['p1', frame(0)]));
+		expect(player(sim).onGround).toBe(true);
+		expect(player(sim).y).toBe(-30);
+		expect(player(sim).deaths).toBe(0);
+	});
+
+	it('holding JUMP flips once, not repeatedly', () => {
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		becomeBall(sim);
+		let flips = 0;
+		let prevDir: 1 | -1 = 1;
+		for (let t = 0; t < 120; t++) {
+			sim.tickOnce(mapOf(['p1', frame(KEY.JUMP)]));
+			const p = player(sim);
+			if (p.gravityDir !== prevDir) {
+				flips++;
+				prevDir = p.gravityDir;
+			}
+		}
+		expect(flips).toBe(1);
+		expect(player(sim).deaths).toBe(0);
+	});
+
+	it('pads and speed portals apply to the ball; spikes still kill it', () => {
+		const level = testLevel(
+			[
+				{ type: 'block', x: 0, y: -240, w: 3000, h: 40 },
+				{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+				{ type: 'portal', x: 10, mode: 'ball' },
+				{ type: 'speed', x: 300, y: -140, mult: 1.3 },
+				{ type: 'pad', x: 500, y: -8, power: 1.4 }
+			],
+			2500
+		);
+		const sim = createGeodashSim(1, config({ durationTicks: 300 }, { level }), [PLAYERS[0]]);
+		becomeBall(sim);
+		const boosts: number[] = [];
+		let padVy = 0;
+		for (let t = 0; t < 100; t++) {
+			sim.tickOnce(mapOf(['p1', frame(0)]));
+			for (const ev of sim.drainEvents()) {
+				if (ev.kind === 'boost') {
+					boosts.push(ev.power);
+					padVy = player(sim).vy;
+				}
+			}
+		}
+		expect(boosts).toEqual([1.3, 1.4]);
+		expect(padVy).toBeLessThan(-18); // pad launches against gravity
+		expect(player(sim).speedMult).toBe(1.3);
+
+		// rolling into a spike kills; the death resets the form to cube
+		// (the re-crossed portal transforms again on the next attempt)
+		const spikeLevel = testLevel(
+			[
+				{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+				{ type: 'portal', x: 10, mode: 'ball' },
+				{ type: 'spike', x: 600, y: -40 }
+			],
+			2500
+		);
+		const deathSim = createGeodashSim(1, config({ durationTicks: 300 }, { level: spikeLevel }), [
+			PLAYERS[0]
+		]);
+		const deathCauses: string[] = [];
+		let modeAtDeath: GeoDashMode | null = null;
+		for (let t = 0; t < 100; t++) {
+			deathSim.tickOnce(mapOf(['p1', frame(0)]));
+			for (const ev of deathSim.drainEvents()) {
+				if (ev.kind === 'death') {
+					deathCauses.push(ev.cause);
+					modeAtDeath = player(deathSim).mode;
+				}
+			}
+		}
+		expect(deathCauses[0]).toBe('spike');
+		expect(modeAtDeath).toBe('cube'); // respawn resets the form
+	});
+});
+
+// ---- mode portals ----
+
+describe('geodash mode portals', () => {
+	const level = testLevel(
+		[
+			{ type: 'block', x: 0, y: 0, w: 3000, h: 80 },
+			{ type: 'portal', x: 500, mode: 'ball' }
+		],
+		2500
+	);
+	const cfg = config({ durationTicks: 200 }, { level });
+
+	it('transforms on the exact tick the portal plane is crossed (deterministic)', () => {
+		const a = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		const b = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		let crossTick = -1;
+		let prevMode: GeoDashMode = 'cube';
+		for (let t = 0; t < 200; t++) {
+			const input = mapOf(['p1', frame(0)]);
+			a.tickOnce(input);
+			b.tickOnce(input);
+			expect(b.hash()).toBe(a.hash());
+			const p = player(a);
+			if (crossTick < 0 && p.x >= 500) {
+				crossTick = t;
+				expect(p.mode).toBe('ball'); // flips exactly on the crossing tick
+				expect(prevMode).toBe('cube');
+			}
+			prevMode = p.mode;
+		}
+		expect(crossTick).toBe(58); // 8.5px/tick: x first reaches 500 on tick 58
+	});
+
+	it('emits a transform event with the target mode on portal entry', () => {
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		const transforms: { tick: number; mode: string }[] = [];
+		for (let t = 0; t < 200; t++) {
+			sim.tickOnce(mapOf(['p1', frame(0)]));
+			for (const ev of sim.drainEvents()) {
+				if (ev.kind === 'transform') transforms.push({ tick: t, mode: ev.mode });
+			}
+		}
+		expect(transforms).toEqual([{ tick: 58, mode: 'ball' }]);
+	});
+
+	it('snapshot/restore/hash include the form', () => {
+		const a = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		for (let t = 0; t < 60; t++) a.tickOnce(mapOf(['p1', frame(0)]));
+		expect(player(a).mode).toBe('ball');
+		const snap = JSON.parse(JSON.stringify(a.snapshot()));
+
+		const b = createGeodashSim(999, cfg, [PLAYERS[0]]);
+		b.restore(snap);
+		expect(player(b).mode).toBe('ball');
+		expect(b.hash()).toBe(a.hash());
+		for (let t = 60; t < 200; t++) {
+			const input = mapOf(['p1', frame(0)]);
+			a.tickOnce(input);
+			b.tickOnce(input);
+			expect(b.hash()).toBe(a.hash());
+		}
+
+		// The hash actually depends on the form: two sims with identical
+		// physics but a portal (form change) vs without must diverge.
+		const plain = createGeodashSim(1, config({ durationTicks: 200 }, { level: flatLevel() }), [
+			PLAYERS[0]
+		]);
+		const withPortal = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		for (let t = 0; t < 100; t++) {
+			plain.tickOnce(mapOf(['p1', frame(0)]));
+			withPortal.tickOnce(mapOf(['p1', frame(0)]));
+		}
+		expect(player(plain).x).toBe(player(withPortal).x);
+		expect(player(plain).y).toBe(player(withPortal).y);
+		expect(plain.hash()).not.toBe(withPortal.hash());
 	});
 });
