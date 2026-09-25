@@ -39,8 +39,8 @@ export const GAME_META: Record<GameId, GameMeta> = {
 		title: 'Turbo Kart',
 		tagline: 'Drift, boost and blast past your rivals.',
 		accent: 'var(--color-kart)',
-		players: '2-8 players',
-		status: 'coming'
+		players: '1-8 players',
+		status: 'playable'
 	},
 	brawl: {
 		id: 'brawl',

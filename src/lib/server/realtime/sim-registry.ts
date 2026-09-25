@@ -6,14 +6,16 @@ import type { GameConfig, GameId, GameSim, SimPlayer } from '$lib/game/types';
 import { createEchoSim } from '$lib/game/modules/echo/sim';
 import { createGeodashSim } from '$lib/game/geodash/sim';
 import { createTankSim } from '$lib/game/tank/sim';
+import { createKartSim } from '$lib/game/kart/sim';
 
 type SimFactory = (seed: number, config: GameConfig, players: SimPlayer[]) => GameSim;
 
 const factories: Partial<Record<GameId, SimFactory>> = {
 	echo: createEchoSim,
 	geodash: createGeodashSim,
-	tank: createTankSim
-	// kart / brawl land in later phases
+	tank: createTankSim,
+	kart: createKartSim
+	// brawl lands in a later phase
 };
 
 export const gameLimits: Record<GameId, { minPlayers: number; maxPlayers: number }> = {
@@ -33,7 +35,11 @@ export const gameConfigs: Record<GameId, GameConfig> = {
 		durationTicks: 60 * 90,
 		options: { mode: 'race', levelId: 'level-1', countdownTicks: 180 }
 	},
-	kart: { tickRate: 60, durationTicks: 60 * 120, options: { laps: 3 } },
+	kart: {
+		tickRate: 60,
+		durationTicks: 60 * 180,
+		options: { trackId: 'sunny-circuit', laps: 3, aiCount: 0, aiDifficulty: 'medium' }
+	},
 	brawl: { tickRate: 60, durationTicks: 60 * 180, options: { stocks: 3 } }
 };
 

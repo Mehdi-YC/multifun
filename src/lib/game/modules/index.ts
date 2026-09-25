@@ -6,6 +6,7 @@ import type { GameId, GameModule } from '../types';
 import { echoModule } from './echo';
 import { geodashModule } from '../geodash';
 import { tankModule } from '../tank';
+import { kartModule } from '../kart';
 
 export * from './echo';
 
@@ -13,7 +14,7 @@ export const gameModules: Record<GameId, GameModule | undefined> = {
 	echo: echoModule,
 	tank: tankModule,
 	geodash: geodashModule,
-	kart: undefined,
+	kart: kartModule,
 	brawl: undefined
 };
 

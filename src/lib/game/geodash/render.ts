@@ -26,8 +26,8 @@ import { InputManager } from '../engine/input';
 import { FixedTimestepLoop } from '../engine/loop';
 import { ParticleSystem } from '../engine/particles';
 import { TweenManager, easeOutQuad } from '../engine/tween';
-import { CUBE_SIZE, blockSize, padRect, portalGate } from './level-types';
-import type { GeoDashLevel, GeoDashMode } from './level-types';
+import { CUBE_SIZE, GRID, blockSize, padRect, portalGate } from './level-types';
+import type { GeoDashLevel, GeoDashMode, GeoDashObject } from './level-types';
 import {
 	COUNTDOWN_TICKS,
 	createGeodashSim,
@@ -156,6 +156,21 @@ function hashNoise(i: number): number {
 /** One sine cycle per beat; levels drive pulses from bpm. */
 function beatPulse(tick: number, bpm: number): number {
 	return Math.sin((tick * bpm * Math.PI * 2) / 3600);
+}
+
+/**
+ * World x range an object's sprite may cover — used for draw culling.
+ * Blocks span their full width (floor slabs are thousands of pixels wide:
+ * culling on their left edge alone used to drop whole slabs while they still
+ * covered the viewport); everything else is at most two cells around its
+ * anchor.
+ */
+function objectSpan(obj: GeoDashObject): { left: number; right: number } {
+	if (obj.type === 'block') {
+		const { w } = blockSize(obj);
+		return { left: obj.x, right: obj.x + w };
+	}
+	return { left: obj.x - GRID, right: obj.x + GRID };
 }
 
 /**
@@ -562,19 +577,26 @@ class GeoDashClientImpl implements GeoDashClient {
 	// ---- world layer ----
 
 	private drawWorld(pulse: number): void {
-		const camLeft = this.camera.x - VIEW_W;
-		const camRight = this.camera.x + VIEW_W;
+		// Cull against the camera's visible world x range (zoom-aware) plus a
+		// margin for shake and sprite overhang. An object is dropped only when
+		// its WHOLE span is outside the window — wide floor slabs must render
+		// for the entire visible x range at any camera position.
+		const halfW = VIEW_W / (2 * this.camera.zoom) + GRID * 2;
+		const camLeft = this.camera.x - halfW;
+		const camRight = this.camera.x + halfW;
 		const objects = this.level.objects;
 
 		// decorative scenery first (behind gameplay)
 		for (const obj of objects) {
 			if (obj.type !== 'deco') continue;
-			if (obj.x < camLeft || obj.x > camRight) continue;
+			const span = objectSpan(obj);
+			if (span.right < camLeft || span.left > camRight) continue;
 			this.drawDeco(obj.x, obj.y, obj.kind);
 		}
 
 		for (const obj of objects) {
-			if (obj.x < camLeft || obj.x > camRight) continue;
+			const span = objectSpan(obj);
+			if (span.right < camLeft || span.left > camRight) continue;
 			switch (obj.type) {
 				case 'block': {
 					const { w, h } = blockSize(obj);

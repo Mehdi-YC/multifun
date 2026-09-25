@@ -586,8 +586,8 @@ readable in pixel art.
 | M5  | GeoDash core + race           | cube mode, 3 levels, ghost races, server-validated results    | M3           | ✅      |
 | M6  | Pixel Tanks: bots + modes     | AI bots (solo + lobby fill), team deathmatch, power-up crates | M4           | ⬜ next |
 | M7  | GeoDash polish + editor       | daily level, wave/ball modes, level editor, sudden death      | M5           | ⬜      |
-| M8  | Turbo Kart core               | kart physics, drift-boost, 1 track, local play + AI           | M3           | ⬜      |
-| M9  | Turbo Kart online             | prediction/reconciliation, items, 3 tracks, time trial        | M8           | ⬜      |
+| M8  | Turbo Kart core + online      | drift-boost physics, 3 tracks, AI, items, online races        | M3           | ✅      |
+| M9  | Turbo Kart polish             | time-trial ghosts, replay saves, more items/tracks            | M8           | ⬜      |
 | M10 | Pixel Brawl core              | movement/combat, 1 character, 1 stage, local versus           | M3           | ⬜      |
 | M11 | Pixel Brawl online            | rollback-lite, 3 characters, 3 stages, stocks/FFA             | M10          | ⬜      |
 | M12 | Social & platform polish      | friends, matchmaking, spectators, achievements, touch         | M6/M7/M9/M11 | ⬜      |
@@ -678,3 +678,22 @@ Notes from building Phase 0 (keep updated per milestone):
   local loop ticks has hazard ① — geodash/echo should adopt the snapshot-clock pattern too.
 - **Tank map upgrades shipped:** random deterministic spawns (shield / triple shot / rapid fire /
   speed) + crate drops, 1s fairness grace, effects live in sim state (snapshots/hash), HUD timers.
+- **GeoDash "finish does nothing" + "floor disappears":** ① the sim ended only when ALL finished or
+  the timer — a race now ends on the FIRST finisher (plan §7.3), so `game.end`/results fire
+  instantly; ② floor slabs are single wide blocks and the draw cull tested only their left edge —
+  once past the slab start the floor vanished; culling now tests the object's full span against a
+  zoom-aware window. New level rules: every pit ≤300px or pad/orb-bridged or overhead-covered.
+- **Tank "latency in the host" was 3 bugs:** the server applies inputs on arrival (ignoring the
+  client's input tick labels), reconcile dropped the last L ticks of input at every key edge, and
+  the decaying correction offset was drawn onto the LOCAL tank. Fix: local tank renders from
+  prediction at zero display lag (corrections snap only on real discontinuities), predicted recoil,
+  and a zero-allocation render/interp path. **Follow-up (protocol-level):** input-ack in snapshots
+  (last applied input tick) would let clients reconcile precisely and remove the workaround;
+  `PixelCanvas.text()` should cache uppercase strings.
+- **Turbo Kart shipped** (plan §8): drift tiers (blue/orange/purple mini-turbos), hop-drift,
+  pads/ramps/tricks/slipstream, soft walls + auto-respawn, items (mushroom/oil/missile/shield/
+  lightning) weighted to trailers, 3 spline tracks (Sunny Circuit / Neon Dojo / Frostbite Falls —
+  road derived from the centerline so the racing line is always drivable), CPU karts with
+  rubber-banding (AI finishes 3 laps on every track = playability guarantee), lap splits +
+  placement results. Netcode built on the tank lessons from day one (snapshot clock, discontinuity
+  snapping, shortest-path angles, zero-lag local kart).

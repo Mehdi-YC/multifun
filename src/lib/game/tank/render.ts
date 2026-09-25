@@ -15,9 +15,17 @@
  *   drops ticks under render load still shows the same world position as one
  *   that keeps up. The interpolation buffer snaps (never slides) across
  *   respawns/deaths and rebase-style corrections.
- * - The local prediction is reconciled against every authoritative snapshot
- *   (`sim.restore` + local-input replay). Small corrections blend (with
- *   shortest-path angle blending), big jumps snap; see `reconcile()`.
+ * - The LOCAL tank is prediction state, always current: it is drawn straight
+ *   from the private sim with zero display offset and zero blending, so a key
+ *   press is on screen in the same frame its tick ran. This is load-bearing
+ *   for latency, not just cosmetics: the authoritative room applies each input
+ *   when it ARRIVES (a network delay after the client sampled it), so the
+ *   snapshot state is always missing the last ~delay ticks of local input.
+ *   Anchoring the display to the restored state — or blending it toward it —
+ *   drags the tank behind its own input at every press/release ("the tank
+ *   feels laggy"). `reconcile()` therefore keeps the predicted pose for the
+ *   local tank and only snaps it when the authority reports a real
+ *   teleport-like discontinuity (death, respawn, elimination, huge jump).
  */
 import type {
 	GameClient,
@@ -54,7 +62,7 @@ import {
 	type TankSnapshot,
 	type TankState
 } from './sim';
-import { RemoteBuffer, SNAP_DISTANCE, angleDelta, wrapAngle } from './interp';
+import { RemoteBuffer, SNAP_DISTANCE } from './interp';
 
 // ---- palette ----
 
@@ -85,8 +93,6 @@ const BULLET_TRAIL = '#ff9f43';
 const FEED_SECONDS = 4.5;
 /** Bounded local-input history used to replay prediction after a restore. */
 const MAX_INPUT_LOG = 120;
-/** Exponential smoothing rate (per second) for prediction-correction blending. */
-const CORRECTION_DECAY = 14;
 
 /** Colors for the four power-up pickups (shared by map icons and HUD). */
 const POWERUP_COLORS: Record<PowerupKind, string> = {
@@ -95,6 +101,29 @@ const POWERUP_COLORS: Record<PowerupKind, string> = {
 	rapid: '#ffe066',
 	speed: '#57e389'
 };
+
+/** Cached `${color}55` glow rings (no template strings in the frame path). */
+const POWERUP_GLOW: Record<PowerupKind, string> = {
+	shield: '#6ec6ff55',
+	triple: '#ffd16655',
+	rapid: '#ffe06655',
+	speed: '#57e38955'
+};
+
+/** HUD effect order (matches the old per-card effects list order). */
+const EFFECT_ORDER: readonly PowerupKind[] = ['shield', 'triple', 'rapid', 'speed'];
+
+/** Cached respawn-count strings ("RESPAWNING n") — drawn every frame while dead. */
+const RESPAWN_LABELS: readonly string[] = Array.from(
+	{ length: 10 },
+	(_, i) => `RESPAWNING ${i + 1}`
+);
+/** Cached bare countdown seconds for the big dead-screen number. */
+const RESPAWN_SECONDS: readonly string[] = Array.from({ length: 10 }, (_, i) => `${i + 1}`);
+
+function respawnSeconds(respawnTimer: number): number {
+	return Math.min(RESPAWN_LABELS.length, Math.max(1, Math.ceil(respawnTimer / 60)));
+}
 
 /** GameClient plus canvas fitting and deterministic driving (tests + loop). */
 export interface TankClient extends GameClient {
@@ -115,10 +144,47 @@ export interface TankClient extends GameClient {
 
 type Explosion = { x: number; y: number; age: number; life: number; size: number; color: string };
 type Burst = { x: number; y: number; age: number; life: number };
-type FeedEntry = { killer: string; victim: string; age: number };
+/** Kill-feed row; the label string is built once on the event, never per frame. */
+type FeedEntry = { label: string; labelWidth: number; age: number };
 
-/** Display-only correction of the predicted self tank toward snapshot truth. */
-type SelfOffset = { x: number; y: number; angle: number };
+/**
+ * Placement ordering used by `results()` (lives, kills, damage, xp, then id):
+ * true when `a` ranks ahead of `b`. Used to compute the local placement
+ * without allocating a ranked list every frame.
+ */
+function ranksAhead(a: TankState, b: TankState): boolean {
+	if (a.lives !== b.lives) return a.lives > b.lives;
+	if (a.kills !== b.kills) return a.kills > b.kills;
+	if (a.damage !== b.damage) return a.damage > b.damage;
+	if (a.xp !== b.xp) return a.xp > b.xp;
+	return a.id < b.id;
+}
+
+/** Empty tank slot for the frame-path scratch (all fields overwritten in place). */
+function blankTank(): TankState {
+	return {
+		id: '',
+		x: 0,
+		y: 0,
+		angle: 0,
+		moveDir: 0,
+		lives: 0,
+		kills: 0,
+		deaths: 0,
+		damage: 0,
+		xp: 0,
+		level: 1,
+		reloadTimer: 0,
+		respawnTimer: 0,
+		invulnTimer: 0,
+		alive: true,
+		lastKeys: 0,
+		shield: 0,
+		triple: 0,
+		rapidTimer: 0,
+		speedTimer: 0
+	};
+}
 
 class TankClientImpl implements TankClient {
 	private readonly ctx: GameContext;
@@ -133,13 +199,15 @@ class TankClientImpl implements TankClient {
 	private readonly sim: TankSim;
 	private readonly tickInputs = new Map<PlayerId, InputFrame>();
 	private readonly playersById: Map<PlayerId, SimPlayer>;
+	/** Sim tanks by id (stable object identity across `restore`). */
+	private readonly tankById = new Map<PlayerId, TankState>();
+	/** The local player's prediction state — drawn with zero display offset. */
+	private selfTank: TankState | null = null;
 
 	/** Authoritative snapshot stream driving all remote-entity rendering. */
 	private readonly buffer = new RemoteBuffer();
 	/** Local input history (keys per prediction tick) for restore replay. */
 	private readonly inputLog: number[] = [];
-	/** Display-only smoothing of prediction corrections (see `reconcile`). */
-	private selfOffset: SelfOffset = { x: 0, y: 0, angle: 0 };
 	/** nowMs() when the newest snapshot was applied (render clock anchor). */
 	private lastSnapMs = nowMs();
 
@@ -153,9 +221,27 @@ class TankClientImpl implements TankClient {
 	private displayCrates: number[] = [];
 	private countdownValue = -1;
 	private countdownAge = 99;
+	private countdownLabel = '';
 	private animFrame = 0;
 	private prevSelfReload = 0;
 	private lastFrameMs = nowMs();
+
+	// ---- zero-allocation frame-path scratch (reused every frame) ----
+
+	/** One remote tank resolved from the buffer, drawn immediately. */
+	private readonly remoteDraw = blankTank();
+	/** Remote shells at the render tick (slots reused across frames). */
+	private readonly shellScratch: BulletState[] = [];
+	/** Power-ups at the render tick (slots reused across frames). */
+	private readonly powerupScratch: PowerupState[] = [];
+	/** Input frame reused when `stepTick`/replay is handed explicit keys. */
+	private readonly inputScratch: InputFrame = { keys: 0 };
+	/** Cached `NAME` labels and `K<n>` counters per player (HUD cards). */
+	private readonly nameLabels = new Map<PlayerId, string>();
+	private readonly killLabels = new Map<PlayerId, { kills: number; label: string }>();
+	/** Cached `PLACE n` for the eliminated overlay. */
+	private placeValue = -1;
+	private placeLabel = '';
 
 	constructor(ctx: GameContext) {
 		this.ctx = ctx;
@@ -166,6 +252,12 @@ class TankClientImpl implements TankClient {
 		this.sim = createTankSim(ctx.seed, ctx.config, ctx.players);
 		this.displayCrates = this.sim.crateHp.slice();
 		this.playersById = new Map(ctx.players.map((p) => [p.id, p]));
+		for (const tank of this.sim.tanks) this.tankById.set(tank.id, tank);
+		this.selfTank = this.tankById.get(ctx.selfId) ?? null;
+		// HUD name labels are invariant for the whole match: build once.
+		for (const player of ctx.players) {
+			this.nameLabels.set(player.id, player.name.slice(0, 8).toUpperCase());
+		}
 		this.camera = new Camera({
 			width: 480,
 			height: 270,
@@ -218,46 +310,47 @@ class TankClientImpl implements TankClient {
 
 	/**
 	 * Prediction reconciliation: restore the private sim to the authoritative
-	 * snapshot, then replay the local inputs recorded since. Applying the
-	 * snapshot REBASES both the sim and the interpolation display: small
-	 * corrections blend out over ~150ms (angles always the short way around),
-	 * while a teleport, death, respawn or lives change snaps instantly — a
-	 * correction must never slide the tank across the map either.
+	 * snapshot, then replay the local inputs recorded since. Discrete state
+	 * (lives, timers, effects, remote tanks, shells, crates) stays fully
+	 * authoritative; the LOCAL TANK'S POSE does not.
+	 *
+	 * The authority applies each input when it arrives — a network delay after
+	 * the client sampled it — so the restored state is always missing the last
+	 * ~delay ticks of local input. Correcting the pose to it (or blending the
+	 * display toward it) therefore yanks the tank back at every key press and
+	 * release: input latency the player can feel. The prediction is exact
+	 * about the local player's own input, so it wins the pose outright, and
+	 * only a real discontinuity — death, respawn, elimination or a huge jump —
+	 * snaps the tank to the authoritative pose. No display offset exists at
+	 * all: what the sim holds is what the next frame draws.
 	 */
 	private reconcile(snap: TankSnapshot): void {
-		const selfBefore = this.sim.tanks.find((t) => t.id === this.ctx.selfId) ?? null;
-		const before = selfBefore
-			? {
-					x: selfBefore.x,
-					y: selfBefore.y,
-					angle: selfBefore.angle,
-					alive: selfBefore.alive,
-					lives: selfBefore.lives
-				}
-			: null;
+		const self = this.selfTank;
+		if (!self) return;
+		const beforeX = self.x;
+		const beforeY = self.y;
+		const beforeAngle = self.angle;
+		const beforeMoveDir = self.moveDir;
+		const beforeAlive = self.alive;
+		const beforeLives = self.lives;
 		const steps = Math.max(0, Math.min(this.sim.tick - snap.tick, this.inputLog.length));
 		this.sim.restore(snap);
 		for (let i = this.inputLog.length - steps; i < this.inputLog.length; i++) {
-			this.tickInputs.set(this.ctx.selfId, { keys: this.inputLog[i] });
+			this.inputScratch.keys = this.inputLog[i];
+			this.tickInputs.set(this.ctx.selfId, this.inputScratch);
 			this.sim.tickOnce(this.tickInputs);
 		}
 		// Prediction events are display noise; the server's event stream owns VFX.
 		this.sim.drainEvents();
 
-		const selfAfter = this.sim.tanks.find((t) => t.id === this.ctx.selfId) ?? null;
-		if (!before || !selfAfter) return;
-		const jump = Math.hypot(selfAfter.x - before.x, selfAfter.y - before.y);
+		const jump = Math.hypot(self.x - beforeX, self.y - beforeY);
 		const rebased =
-			jump > SNAP_DISTANCE || selfAfter.alive !== before.alive || selfAfter.lives !== before.lives;
-		if (rebased) {
-			this.selfOffset = { x: 0, y: 0, angle: 0 };
-			return;
-		}
-		this.selfOffset.x += before.x - selfAfter.x;
-		this.selfOffset.y += before.y - selfAfter.y;
-		this.selfOffset.angle = wrapAngle(
-			this.selfOffset.angle + angleDelta(selfAfter.angle, before.angle)
-		);
+			jump > SNAP_DISTANCE || self.alive !== beforeAlive || self.lives !== beforeLives;
+		if (rebased) return;
+		self.x = beforeX;
+		self.y = beforeY;
+		self.angle = beforeAngle;
+		self.moveDir = beforeMoveDir;
 	}
 
 	onEvent(ev: GameEvent): void {
@@ -306,11 +399,9 @@ class TankClientImpl implements TankClient {
 				const victim = this.playersById.get(ev.player);
 				const killerId = this.pendingKiller.get(ev.player) ?? ev.player;
 				const killer = this.playersById.get(killerId);
-				this.feed.push({
-					killer: (killer?.name ?? killerId).toUpperCase(),
-					victim: (victim?.name ?? ev.player).toUpperCase(),
-					age: 0
-				});
+				// The label is built once here so the frame path never strings.
+				const label = `${(killer?.name ?? killerId).toUpperCase()} > ${(victim?.name ?? ev.player).toUpperCase()}`;
+				this.feed.push({ label, labelWidth: this.pixel.textWidth(label, 1), age: 0 });
 				if (this.feed.length > 5) this.feed.shift();
 				this.audio.sfx.death();
 				break;
@@ -344,6 +435,8 @@ class TankClientImpl implements TankClient {
 			case 'countdown':
 				this.countdownValue = ev.value;
 				this.countdownAge = 0;
+				// Cache the label: the HUD draws it every frame for a second.
+				this.countdownLabel = ev.value === 0 ? 'GO!' : String(ev.value);
 				this.audio.sfx.countdown();
 				break;
 			case 'finish':
@@ -358,8 +451,14 @@ class TankClientImpl implements TankClient {
 	// ---- fixed tick: sample input, send it, predict locally ----
 
 	stepTick(keys?: number): void {
-		if (keys === undefined) this.input.pollGamepads();
-		const frame = keys === undefined ? this.input.sample() : { keys };
+		let frame: InputFrame;
+		if (keys === undefined) {
+			this.input.pollGamepads();
+			frame = this.input.sample();
+		} else {
+			this.inputScratch.keys = keys;
+			frame = this.inputScratch;
+		}
 		this.ctx.sendInput(frame);
 		this.tickInputs.set(this.ctx.selfId, frame);
 		// Keep the input history so snapshot restores can replay the local
@@ -369,7 +468,7 @@ class TankClientImpl implements TankClient {
 		this.sim.tickOnce(this.tickInputs);
 
 		// Fire blip from the local prediction (firing is not a GameEvent).
-		const self = this.sim.tanks.find((t) => t.id === this.ctx.selfId);
+		const self = this.selfTank;
 		if (self && self.reloadTimer > this.prevSelfReload) this.audio.sfx.jump();
 		this.prevSelfReload = self ? self.reloadTimer : 0;
 		// Prediction events are display noise; the server's events own the VFX.
@@ -404,22 +503,27 @@ class TankClientImpl implements TankClient {
 		this.animFrame++;
 		this.countdownAge += dt;
 		this.particles.update(dt);
-		// Prediction corrections blend out (shortest-path angle, see reconcile).
-		const keep = Math.exp(-CORRECTION_DECAY * dt);
-		this.selfOffset.x *= keep;
-		this.selfOffset.y *= keep;
-		this.selfOffset.angle *= keep;
 		this.camera.follow(
 			(this.sim.arena.cols * TILE_SIZE) / 2,
 			(this.sim.arena.rows * TILE_SIZE) / 2,
 			dt
 		);
-		for (const e of this.explosions) e.age += dt;
-		for (const b of this.bursts) b.age += dt;
-		for (const f of this.feed) f.age += dt;
-		this.removeExpired(this.explosions, (e) => e.age >= e.life);
-		this.removeExpired(this.bursts, (b) => b.age >= b.life);
-		this.removeExpired(this.feed, (f) => f.age >= FEED_SECONDS);
+		// Age + expire in place (no closure/filter churn in the frame path).
+		for (let i = this.explosions.length - 1; i >= 0; i--) {
+			const e = this.explosions[i];
+			e.age += dt;
+			if (e.age >= e.life) this.explosions.splice(i, 1);
+		}
+		for (let i = this.bursts.length - 1; i >= 0; i--) {
+			const b = this.bursts[i];
+			b.age += dt;
+			if (b.age >= b.life) this.bursts.splice(i, 1);
+		}
+		for (let i = this.feed.length - 1; i >= 0; i--) {
+			const f = this.feed[i];
+			f.age += dt;
+			if (f.age >= FEED_SECONDS) this.feed.splice(i, 1);
+		}
 		this.syncCrates();
 
 		// World time for everything the buffer interpolates; `alpha` only
@@ -446,17 +550,15 @@ class TankClientImpl implements TankClient {
 		this.drawHud();
 	}
 
-	private removeExpired<T>(list: T[], expired: (item: T) => boolean): void {
-		for (let i = list.length - 1; i >= 0; i--) {
-			if (expired(list[i])) list.splice(i, 1);
-		}
-	}
-
 	/** Debris whenever a crate loses a hit point (works for remote shooters too). */
 	private syncCrates(): void {
-		const target = this.latestCrates();
-		for (let i = 0; i < this.displayCrates.length && i < target.length; i++) {
-			if (target[i] < this.displayCrates[i]) {
+		const target = this.buffer.latestCratesRef() ?? this.sim.crateHp;
+		const display = this.displayCrates;
+		if (display.length !== target.length) display.length = target.length;
+		for (let i = 0; i < target.length; i++) {
+			const hp = target[i];
+			const was = display[i] ?? 0;
+			if (hp < was) {
 				const col = i % this.sim.arena.cols;
 				const row = Math.floor(i / this.sim.arena.cols);
 				const x = col * TILE_SIZE + TILE_SIZE / 2;
@@ -465,18 +567,14 @@ class TankClientImpl implements TankClient {
 					kind: 'pop',
 					x,
 					y,
-					count: target[i] === 0 ? 10 : 5,
+					count: hp === 0 ? 10 : 5,
 					speed: 90,
 					color: CRATE
 				});
-				if (target[i] === 0) this.spawnExplosion(x, y, 0.12, CRATE_LIGHT);
+				if (hp === 0) this.spawnExplosion(x, y, 0.12, CRATE_LIGHT);
 			}
+			display[i] = hp;
 		}
-		this.displayCrates = target;
-	}
-
-	private latestCrates(): number[] {
-		return this.buffer.latestCrates() ?? this.sim.crateHp.slice();
 	}
 
 	private spawnExplosion(x: number, y: number, trauma: number, color = '#ff9f43'): void {
@@ -489,7 +587,7 @@ class TankClientImpl implements TankClient {
 
 	/** Latest known state of a tank (snapshot first, local prediction fallback). */
 	private displayTank(id: PlayerId): TankState | null {
-		return this.buffer.latestTank(id) ?? this.sim.tanks.find((t) => t.id === id) ?? null;
+		return this.buffer.latestTank(id) ?? this.tankById.get(id) ?? null;
 	}
 
 	// ---- arena drawing ----
@@ -598,11 +696,15 @@ class TankClientImpl implements TankClient {
 	 * from the snapshot buffer. Muzzle flashes derive from young shells.
 	 */
 	private drawShells(renderTick: number): void {
-		for (const b of this.sim.bullets) {
+		const own = this.sim.bullets;
+		for (let i = 0; i < own.length; i++) {
+			const b = own[i];
 			if (b.owner !== this.ctx.selfId) continue;
 			this.drawShell(b);
 		}
-		for (const b of this.buffer.bulletsAt(renderTick)) {
+		const remote = this.buffer.bulletsAtInto(renderTick, this.shellScratch);
+		for (let i = 0; i < remote; i++) {
+			const b = this.shellScratch[i];
 			if (b.owner === this.ctx.selfId) continue;
 			this.drawShell(b);
 		}
@@ -620,16 +722,19 @@ class TankClientImpl implements TankClient {
 
 	/**
 	 * Remote tanks render from interpolated snapshot state (snapped across
-	 * respawns), the self tank from local prediction plus its correction
-	 * offset. While dead the wreck/ghost stays hidden — only the respawn
-	 * countdown shows — and an eliminated tank shows nothing at all.
+	 * respawns), the self tank straight from the prediction sim with zero
+	 * display offset — prediction state, always current. While dead the
+	 * wreck/ghost stays hidden — only the respawn countdown shows — and an
+	 * eliminated tank shows nothing at all.
 	 */
 	private drawTanks(renderTick: number): void {
-		for (const player of this.ctx.players) {
+		const players = this.ctx.players;
+		for (let i = 0; i < players.length; i++) {
+			const player = players[i];
 			if (player.id === this.ctx.selfId) continue;
 			const pos =
-				this.buffer.tankAt(player.id, renderTick) ??
-				this.sim.tanks.find((t) => t.id === player.id) ??
+				this.buffer.tankAtInto(player.id, renderTick, this.remoteDraw) ??
+				this.tankById.get(player.id) ??
 				null;
 			if (!pos) continue;
 			if (!pos.alive) {
@@ -640,7 +745,7 @@ class TankClientImpl implements TankClient {
 			}
 			this.drawTank(pos, player.color);
 		}
-		const self = this.sim.tanks.find((t) => t.id === this.ctx.selfId);
+		const self = this.selfTank;
 		const meta = this.playersById.get(this.ctx.selfId);
 		if (self && meta) {
 			if (!self.alive) {
@@ -649,15 +754,7 @@ class TankClientImpl implements TankClient {
 				}
 				return;
 			}
-			this.drawTank(
-				{
-					...self,
-					x: self.x + this.selfOffset.x,
-					y: self.y + this.selfOffset.y,
-					angle: wrapAngle(self.angle + this.selfOffset.angle)
-				},
-				meta.color
-			);
+			this.drawTank(self, meta.color);
 		}
 	}
 
@@ -671,6 +768,13 @@ class TankClientImpl implements TankClient {
 			pixel.circle(tank.x, tank.y, TANK_HALF + 4 + pulse, 'rgba(110,198,255,0.55)', false);
 			pixel.fillRect(tank.x - TANK_HALF - 4, tank.y - TANK_HALF - 5, 3, 1, '#bfe9ff');
 		}
+		// Fire feedback derives from the drawn tank's own reload state, so the
+		// local (predicted) tank flashes and recoils the same frame the shot
+		// fired — never gated on a server event or snapshot round trip.
+		const effectiveReload =
+			tank.rapidTimer > 0 ? rapidReloadTicks(tank.level) : reloadTicks(tank.level);
+		const justFired = tank.reloadTimer >= effectiveReload - 3;
+		const kick = justFired ? 2 : 0;
 		const ctx = pixel.ctx;
 		ctx.save();
 		ctx.translate(Math.round(tank.x), Math.round(tank.y));
@@ -689,11 +793,11 @@ class TankClientImpl implements TankClient {
 		pixel.fillRect(-6, -4, 12, 8, color);
 		pixel.fillRect(-6, -4, 12, 2, 'rgba(255,255,255,0.22)');
 		pixel.fillRect(-6, 2, 12, 2, 'rgba(0,0,0,0.28)');
-		// Turret + barrel.
+		// Turret + barrel (the barrel kicks back on the fire ticks).
 		pixel.fillRect(-3, -3, 6, 6, color);
 		pixel.fillRect(-3, -3, 6, 2, 'rgba(255,255,255,0.22)');
-		pixel.fillRect(1, -1, 9, 2, BARREL);
-		pixel.fillRect(9, -2, 3, 4, '#c9c9d6');
+		pixel.fillRect(1 - kick, -1, 9, 2, BARREL);
+		pixel.fillRect(9 - kick, -2, 3, 4, '#c9c9d6');
 		// Speed lines trail the hull while the `speed` boost drives it.
 		if (tank.speedTimer > 0 && tank.moveDir !== 0) {
 			pixel.fillRect(-12, -5, 4, 1, 'rgba(87,227,137,0.7)');
@@ -702,15 +806,10 @@ class TankClientImpl implements TankClient {
 		}
 		ctx.restore();
 		// Muzzle flash on the fire ticks — three-way while `triple` has shots.
-		const effectiveReload =
-			tank.rapidTimer > 0 ? rapidReloadTicks(tank.level) : reloadTicks(tank.level);
-		const justFired = tank.reloadTimer >= effectiveReload - 3;
 		if (justFired) {
-			const angles =
-				tank.triple > 0
-					? [tank.angle - TRIPLE_SPREAD, tank.angle, tank.angle + TRIPLE_SPREAD]
-					: [tank.angle];
-			for (const angle of angles) {
+			const shots = tank.triple > 0 ? 3 : 1;
+			for (let k = 0; k < shots; k++) {
+				const angle = shots === 1 ? tank.angle : tank.angle + (k - 1) * TRIPLE_SPREAD;
 				const dx = Math.cos(angle);
 				const dy = Math.sin(angle);
 				const fx = tank.x + dx * (TANK_HALF + 7);
@@ -736,8 +835,7 @@ class TankClientImpl implements TankClient {
 	}
 
 	private drawRespawnLabel(x: number, y: number, respawnTimer: number): void {
-		const seconds = Math.max(1, Math.ceil(respawnTimer / 60));
-		const label = `RESPAWNING ${seconds}`;
+		const label = RESPAWN_LABELS[respawnSeconds(respawnTimer) - 1];
 		this.pixel.text(label, x - this.pixel.textWidth(label, 1) / 2, y - 20, TEXT_DIM, 1);
 	}
 
@@ -749,9 +847,13 @@ class TankClientImpl implements TankClient {
 	 * Positions come from the snapshot clock like every other remote entity.
 	 */
 	private drawPowerups(renderTick: number): void {
-		const list =
-			this.buffer.length > 0 ? this.buffer.powerupsAt(renderTick) : [...this.sim.powerups];
-		for (const powerup of list) this.drawPowerup(powerup);
+		if (this.buffer.length === 0) {
+			const sim = this.sim.powerups;
+			for (let i = 0; i < sim.length; i++) this.drawPowerup(sim[i]);
+			return;
+		}
+		const list = this.buffer.powerupsAtInto(renderTick, this.powerupScratch);
+		for (let i = 0; i < list; i++) this.drawPowerup(this.powerupScratch[i]);
 	}
 
 	private drawPowerup(powerup: PowerupState): void {
@@ -763,7 +865,7 @@ class TankClientImpl implements TankClient {
 		// Pulsing glow ring (two-frame sparkle keeps the pixel-art feel).
 		const pulse = (Math.floor(this.animFrame / 10) + powerup.id) % 2;
 		pixel.circle(x, y, 9 + pulse, 'rgba(255,255,255,0.12)', true);
-		pixel.circle(x, y, 8, `${color}55`, false);
+		pixel.circle(x, y, 8, POWERUP_GLOW[powerup.kind], false);
 		switch (powerup.kind) {
 			case 'shield':
 				// Bubble with a highlight crescent.
@@ -773,12 +875,10 @@ class TankClientImpl implements TankClient {
 				pixel.fillRect(x - 4, y - 2, 1, 2, '#bfe9ff');
 				break;
 			case 'triple': {
-				// Three shells fanned forward.
-				for (const [ox, oy] of [
-					[-5, 1],
-					[-1, -1],
-					[3, 1]
-				] as const) {
+				// Three shells fanned forward (-5,1), (-1,-1), (3,1).
+				for (let i = 0; i < 3; i++) {
+					const ox = -5 + i * 4;
+					const oy = i === 1 ? -1 : 1;
 					pixel.fillRect(x + ox - 1, y + oy - 1, 3, 3, BULLET_CORE);
 					pixel.fillRect(x + ox - 3, y + oy, 2, 1, BULLET_TRAIL);
 				}
@@ -807,7 +907,8 @@ class TankClientImpl implements TankClient {
 
 	private drawEffects(): void {
 		const pixel = this.pixel;
-		for (const e of this.explosions) {
+		for (let i = 0; i < this.explosions.length; i++) {
+			const e = this.explosions[i];
 			const t = e.age / e.life;
 			pixel.ctx.globalAlpha = Math.max(0, 1 - t);
 			const r = e.size * (0.3 + 0.7 * t);
@@ -816,11 +917,12 @@ class TankClientImpl implements TankClient {
 			pixel.fillRect(e.x - 1, e.y - 1, 3, 3, '#ffe066');
 			pixel.ctx.globalAlpha = 1;
 		}
-		for (const b of this.bursts) {
+		for (let i = 0; i < this.bursts.length; i++) {
+			const b = this.bursts[i];
 			const t = b.age / b.life;
 			pixel.ctx.globalAlpha = Math.max(0, 1 - t);
-			for (let i = 0; i < 6; i++) {
-				const angle = (Math.PI * 2 * i) / 6 + t * 2;
+			for (let k = 0; k < 6; k++) {
+				const angle = (Math.PI * 2 * k) / 6 + t * 2;
 				const r = 6 + 16 * t;
 				const sx = b.x + Math.cos(angle) * r;
 				const sy = b.y + Math.sin(angle) * r;
@@ -834,36 +936,43 @@ class TankClientImpl implements TankClient {
 
 	private drawHud(): void {
 		const pixel = this.pixel;
-		const tanks = this.ctx.players
-			.map((p) => ({ meta: p, state: this.displayTank(p.id) }))
-			.filter((e): e is { meta: SimPlayer; state: TankState } => e.state !== null);
-		const n = tanks.length;
-		tanks.forEach((entry, i) => {
+		const players = this.ctx.players;
+		// Two index passes over players: the card layout needs the number of
+		// known tanks first, and neither pass may allocate per frame.
+		let n = 0;
+		for (let i = 0; i < players.length; i++) {
+			if (this.displayTank(players[i].id) !== null) n++;
+		}
+		let slot = 0;
+		for (let i = 0; i < players.length; i++) {
+			const meta = players[i];
+			const state = this.displayTank(meta.id);
+			if (!state) continue;
 			let x: number;
 			let y: number;
 			if (n <= 4) {
-				x = i % 2 === 0 ? 4 : 480 - 122;
-				y = i < 2 ? 4 : 270 - 26;
+				x = slot % 2 === 0 ? 4 : 480 - 122;
+				y = slot < 2 ? 4 : 270 - 26;
 			} else {
-				x = 4 + (i % 4) * 118;
-				y = i < 4 ? 4 : 270 - 26;
+				x = 4 + (slot % 4) * 118;
+				y = slot < 4 ? 4 : 270 - 26;
 			}
-			this.drawCard(x, y, entry.meta, entry.state);
-		});
+			this.drawCard(x, y, meta, state);
+			slot++;
+		}
 
-		// Kill feed, top right under the cards.
+		// Kill feed, top right under the cards (labels prebuilt on the event).
 		const feedTop = n <= 4 ? 28 : 30;
-		this.feed.forEach((f, i) => {
-			const label = `${f.killer} > ${f.victim}`;
-			const w = pixel.textWidth(label, 1);
+		for (let i = 0; i < this.feed.length; i++) {
+			const f = this.feed[i];
 			pixel.ctx.globalAlpha = Math.max(0, 1 - f.age / FEED_SECONDS);
-			pixel.text(label, 476 - w, feedTop + i * 10, TEXT_DIM, 1);
+			pixel.text(f.label, 476 - f.labelWidth, feedTop + i * 10, TEXT_DIM, 1);
 			pixel.ctx.globalAlpha = 1;
-		});
+		}
 
-		// Match start countdown.
+		// Match start countdown (label cached when the event arrived).
 		if (this.countdownAge < 1 && this.countdownValue >= 0) {
-			const label = this.countdownValue === 0 ? 'GO!' : String(this.countdownValue);
+			const label = this.countdownLabel;
 			const scale = 4;
 			pixel.ctx.globalAlpha = Math.max(0, 1 - this.countdownAge);
 			pixel.text(label, 240 - pixel.textWidth(label, scale) / 2, 110, TEXT, scale);
@@ -873,35 +982,65 @@ class TankClientImpl implements TankClient {
 		this.drawLocalOverlay();
 	}
 
+	/** Cached `NAME` label (uppercased + truncated once per match). */
+	private nameLabel(meta: SimPlayer): string {
+		return this.nameLabels.get(meta.id) ?? '';
+	}
+
+	/** Cached `K<n>` counter; rebuilt only when the kill count changes. */
+	private killLabel(id: PlayerId, kills: number): string {
+		const cached = this.killLabels.get(id);
+		if (cached && cached.kills === kills) return cached.label;
+		const label = `K${kills}`;
+		this.killLabels.set(id, { kills, label });
+		return label;
+	}
+
 	private drawCard(x: number, y: number, meta: SimPlayer, state: TankState): void {
 		const pixel = this.pixel;
 		const isSelf = meta.id === this.ctx.selfId;
 		pixel.fillRect(x, y, 118, 22, PANEL);
 		pixel.rect(x + 0.5, y + 0.5, 117, 21, isSelf ? meta.color : PANEL_EDGE);
 		pixel.fillRect(x + 3, y + 3, 5, 5, meta.color);
-		pixel.text(meta.name.slice(0, 8).toUpperCase(), x + 11, y + 3, isSelf ? TEXT : TEXT_DIM, 1);
-		pixel.text(`K${state.kills}`, x + 92, y + 3, TEXT_DIM, 1);
+		pixel.text(this.nameLabel(meta), x + 11, y + 3, isSelf ? TEXT : TEXT_DIM, 1);
+		pixel.text(this.killLabel(meta.id, state.kills), x + 92, y + 3, TEXT_DIM, 1);
 		// Level as stars.
 		for (let i = 0; i < state.level; i++) this.drawStar(x + 11 + i * 5, y + 13, '#ffd166');
 		// Lives as tank icons.
-		for (let i = 0; i < Math.min(3, state.lives); i++) {
+		const lives = Math.min(3, state.lives);
+		for (let i = 0; i < lives; i++) {
 			pixel.fillRect(x + 40 + i * 7, y + 13, 5, 3, meta.color);
 			pixel.fillRect(x + 44 + i * 7, y + 14, 2, 1, meta.color);
 		}
 		// Dead vs eliminated, straight from snapshot state.
 		if (!state.alive) pixel.text(state.lives > 0 ? 'DEAD' : 'OUT', x + 62, y + 13, '#ff5c7a', 1);
-		// Active effects: tiny icons + remaining-time bars.
-		const effects: Array<{ kind: PowerupKind; t: number }> = [];
-		if (state.shield > 0) effects.push({ kind: 'shield', t: 1 });
-		if (state.triple > 0) effects.push({ kind: 'triple', t: state.triple / TRIPLE_SHOTS });
-		if (state.rapidTimer > 0) effects.push({ kind: 'rapid', t: state.rapidTimer / EFFECT_TICKS });
-		if (state.speedTimer > 0) effects.push({ kind: 'speed', t: state.speedTimer / EFFECT_TICKS });
-		effects.slice(0, 4).forEach((effect, i) => {
-			const ex = x + 74 + i * 8;
-			this.drawEffectIcon(ex, y + 11, effect.kind);
+		// Active effects: tiny icons + remaining-time bars. Fixed order, no
+		// per-card arrays — at most four slots, filled in EFFECT_ORDER.
+		let slot = 0;
+		for (let k = 0; k < EFFECT_ORDER.length && slot < 4; k++) {
+			const kind = EFFECT_ORDER[k];
+			let t = 0;
+			switch (kind) {
+				case 'shield':
+					t = state.shield > 0 ? 1 : 0;
+					break;
+				case 'triple':
+					t = state.triple / TRIPLE_SHOTS;
+					break;
+				case 'rapid':
+					t = state.rapidTimer / EFFECT_TICKS;
+					break;
+				case 'speed':
+					t = state.speedTimer / EFFECT_TICKS;
+					break;
+			}
+			if (t <= 0) continue;
+			const ex = x + 74 + slot * 8;
+			this.drawEffectIcon(ex, y + 11, kind);
 			pixel.fillRect(ex, y + 18, 5, 1, PANEL_EDGE);
-			pixel.fillRect(ex, y + 18, Math.max(1, Math.round(5 * effect.t)), 1, meta.color);
-		});
+			pixel.fillRect(ex, y + 18, Math.max(1, Math.round(5 * t)), 1, meta.color);
+			slot++;
+		}
 	}
 
 	private drawStar(x: number, y: number, color: string): void {
@@ -941,7 +1080,7 @@ class TankClientImpl implements TankClient {
 	}
 
 	private drawLocalOverlay(): void {
-		const self = this.sim.tanks.find((t) => t.id === this.ctx.selfId);
+		const self = this.selfTank;
 		if (!self || self.alive) return;
 		const pixel = this.pixel;
 		pixel.ctx.globalAlpha = 0.35;
@@ -950,15 +1089,28 @@ class TankClientImpl implements TankClient {
 		if (self.lives > 0) {
 			const label = 'RESPAWNING';
 			pixel.text(label, 240 - pixel.textWidth(label, 2) / 2, 118, TEXT, 2);
-			const n = String(Math.max(1, Math.ceil(self.respawnTimer / 60)));
+			const n = RESPAWN_SECONDS[respawnSeconds(self.respawnTimer) - 1];
 			pixel.text(n, 240 - pixel.textWidth(n, 4) / 2, 136, TEXT, 4);
 		} else {
 			const label = 'ELIMINATED - WATCHING';
 			pixel.text(label, 240 - pixel.textWidth(label, 2) / 2, 118, '#ff5c7a', 2);
-			const place = this.sim.results().find((r) => r.player === self.id)?.placement ?? 0;
-			const line = `PLACE ${place}`;
+			const line = this.placeLabelOf(self);
 			pixel.text(line, 240 - pixel.textWidth(line, 2) / 2, 140, TEXT_DIM, 2);
 		}
+	}
+
+	/** Cached `PLACE n`; rebuilt only when the placement changes. */
+	private placeLabelOf(self: TankState): string {
+		let place = 1;
+		const tanks = this.sim.tanks;
+		for (let i = 0; i < tanks.length; i++) {
+			if (tanks[i] !== self && ranksAhead(tanks[i], self)) place++;
+		}
+		if (place !== this.placeValue) {
+			this.placeValue = place;
+			this.placeLabel = `PLACE ${place}`;
+		}
+		return this.placeLabel;
 	}
 
 	// ---- snapshot interpolation lives in `interp.ts` (RemoteBuffer) ----

@@ -15,13 +15,15 @@
  *     keep doing so when one browser's loop drops ticks under render load
  *     (the classic "bigger window, worse desync" symptom).
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { setNowSource } from '../engine/fixed';
 import type { Canvas2DLike, CanvasSourceLike } from '../engine/gfx';
 import type { GameConfig, GameContext, InputFrame, PlayerId, SimPlayer } from '../types';
 import { KEY } from '../types';
 import { createTankSim, type TankSim } from './sim';
 import { createTankClient, type TankClient } from './render';
+import { wrapAngle } from './interp';
+import { tankModule } from './index';
 
 const DEG = Math.PI / 180;
 
@@ -567,10 +569,13 @@ describe('tank render: angle seam', () => {
 		}
 	});
 
-	it('blends prediction corrections for the local tank the short way too', () => {
+	it('keeps the local hull exactly at its predicted angle across snapshot corrections', () => {
 		// Prediction reaches +178.5deg by turning right in place; authority
-		// sits just over the seam at -180.5deg. The correction is a ~1deg step,
-		// never the 359deg spin a naive (after - before) offset would carry.
+		// sits just over the seam at -180.5deg. The local tank is prediction
+		// state, always current: the hull renders at the predicted angle in
+		// the very frame the input was applied. Any display blend toward the
+		// corrected angle would drift the hull away from the player's own
+		// input over the next frames — the "latency" a player feels.
 		const client = makeClient(960, 540);
 		const server = createTankSim(1337, CONFIG, PLAYERS);
 		for (let i = 0; i < 51; i++) client.client.stepTick(KEY.RIGHT); // 51 * 3.5deg
@@ -578,15 +583,260 @@ describe('tank render: angle seam', () => {
 		server.tanks[0].angle = -180.5 * DEG;
 		client.client.onSnapshot(server.snapshot());
 
+		const predicted = wrapAngle(51 * 3.5 * DEG);
 		for (let frame = 0; frame < 6; frame++) {
 			client.rec.ops.length = 0;
 			client.client.renderFrame(0);
 			const hulls = hullDraws(client.rec, P1.color);
 			expect(hulls.length).toBe(1);
-			// Stays near +-180deg through the correction decay. A 359deg
-			// offset whips the hull through 90deg within a frame or two.
-			expect(Math.abs(Math.abs(hulls[0].angle) - Math.PI)).toBeLessThan(20 * DEG);
+			// Exactly the prediction — no correction blend may move the display.
+			expect(hulls[0].angle).toBeCloseTo(predicted, 4);
 			now += 1000 / 60;
 		}
+	});
+});
+
+// ---- (e) local input latency: prediction is displayed with zero delay ----
+
+describe('tank render: local input latency', () => {
+	/**
+	 * Replay the real netcode shape: the authoritative room consumes each
+	 * input at ARRIVAL, L ticks after the client sampled it (GameRoom applies
+	 * inputs when they land, ignoring the client's tick label), and its 20Hz
+	 * snapshots come back D ticks late. Through all of that the client must
+	 * draw its own tank at the pure prediction — the position/angle the
+	 * just-applied tick produced — never the authority's delayed state and
+	 * never a display blend between the two.
+	 */
+	function runDelayedAuthority(drive: (t: number) => number, ticks: number): string[] {
+		const L = 4; // input application delay on the server, in ticks
+		const D = 3; // snapshot delivery delay, in ticks
+		const client = makeClient(960, 540);
+		const server = createTankSim(1337, CONFIG, PLAYERS);
+		const reference = createTankSim(1337, CONFIG, PLAYERS);
+		const sampled: number[] = [];
+		const inFlight: { at: number; snap: ReturnType<TankSim['snapshot']> }[] = [];
+		const errors: string[] = [];
+		let diverged = false;
+
+		for (let t = 0; t < ticks; t++) {
+			const keys = drive(t);
+			sampled.push(keys);
+			client.client.stepTick(keys);
+			reference.tickOnce(inputMap({ p1: keys }));
+			// Arrival-time consumption: the server applies the input sampled L
+			// ticks ago — exactly what a real network delay does to it.
+			server.tickOnce(inputMap({ p1: t - L >= 0 ? sampled[t - L] : 0 }));
+			if (server.tick % 3 === 0) inFlight.push({ at: t + D, snap: server.snapshot() });
+			for (let i = 0; i < inFlight.length;) {
+				if (inFlight[i].at <= t) {
+					client.client.onSnapshot(inFlight[i].snap);
+					inFlight.splice(i, 1);
+				} else {
+					i++;
+				}
+			}
+			client.rec.ops.length = 0;
+			client.client.renderFrame(0);
+			const self = reference.tanks[0];
+			const hulls = hullDraws(client.rec, P1.color);
+			if (hulls.length !== 1) {
+				errors.push(`tick ${t}: expected exactly 1 hull, got ${hulls.length}`);
+			} else {
+				// The camera centers the 272px-tall arena in the 270px viewport
+				// (net translate (0, -1)); the hull center is the rounded tank
+				// position under it. Prediction state, always current: this is
+				// the position AFTER this tick's input movement.
+				const wantX = Math.round(self.x);
+				const wantY = Math.round(self.y) - 1;
+				if (hulls[0].x !== wantX || hulls[0].y !== wantY) {
+					errors.push(
+						`tick ${t}: drew hull at ${hulls[0].x},${hulls[0].y} but the prediction is ${wantX},${wantY}`
+					);
+				}
+				if (Math.abs(wrapAngle(hulls[0].angle) - wrapAngle(self.angle)) > 1e-4) {
+					errors.push(`tick ${t}: drew hull angle ${hulls[0].angle}, prediction is ${self.angle}`);
+				}
+			}
+			if (server.tanks[0].x !== self.x || server.tanks[0].angle !== self.angle) diverged = true;
+			now += 1000 / 60;
+		}
+		// The scenario really misaligned authority and prediction — every
+		// reconcile had a correction to (mis)apply.
+		expect(diverged).toBe(true);
+		return errors;
+	}
+
+	it('draws the local tank at its predicted position the same frame the input is applied', () => {
+		// Press UP mid-run: the movement of the press tick must be on screen
+		// before the next frame — not hidden behind a correction blend or the
+		// authority's input-delayed position.
+		const errors = runDelayedAuthority((t) => (t >= 20 ? KEY.UP : 0), 60);
+		expect(errors).toEqual([]);
+	});
+
+	it('draws the local tank at its predicted angle the same frame the turn is applied', () => {
+		// Rotation has no collisions at all, so every bit of drift here is
+		// pure display latency.
+		const errors = runDelayedAuthority((t) => (t >= 20 ? KEY.RIGHT : 0), 60);
+		expect(errors).toEqual([]);
+	});
+});
+
+// ---- (f) fire feedback is instant, never gated on the server ----
+
+describe('tank render: instant fire feedback', () => {
+	/** Muzzle flash: the 6x6 alpha fill only `drawTank`'s flash draws. */
+	function flashDraws(rec: RecordingContext): DrawOp[] {
+		return rec.ops.filter(
+			(op) => op.op === 'fillRect' && op.style === 'rgba(255,224,102,0.85)' && op.args[2] === 6
+		);
+	}
+
+	/** Barrel recoil: the breech block kicked 2px back from its rest x=9. */
+	function recoilDraws(rec: RecordingContext): DrawOp[] {
+		return rec.ops.filter(
+			(op) => op.op === 'fillRect' && op.style === '#c9c9d6' && op.args[0] === 7
+		);
+	}
+
+	it('pops the muzzle flash and barrel recoil in the same frame as the predicted fire', () => {
+		const client = makeClient(960, 540);
+		// No snapshots arrive at all: feedback must ride the prediction alone.
+		client.client.stepTick(0);
+		client.rec.ops.length = 0;
+		client.client.renderFrame(0);
+		expect(flashDraws(client.rec)).toHaveLength(0);
+		expect(recoilDraws(client.rec)).toHaveLength(0);
+
+		client.rec.ops.length = 0;
+		client.client.stepTick(KEY.JUMP); // fire input — the prediction fires now
+		client.client.renderFrame(0); // ...and this very frame shows it
+		expect(flashDraws(client.rec).length).toBeGreaterThan(0);
+		expect(recoilDraws(client.rec).length).toBeGreaterThan(0);
+		// The predicted shell itself is on screen the same frame too.
+		expect(shellDraws(client.rec).length).toBeGreaterThan(0);
+	});
+});
+
+// ---- (g) frame budget: no per-frame allocation churn in the hot path ----
+
+describe('tank render: frame budget', () => {
+	/** Steady-state client: snapshots, remote tanks, power-ups, HUD, kill feed. */
+	function steadyClient(): Harness {
+		const client = makeClient(960, 540);
+		const server = createTankSim(1337, CONFIG, PLAYERS);
+		for (let t = 0; t < 330; t++) {
+			server.tickOnce(inputMap({ p2: t % 3 === 0 ? KEY.RIGHT : 0, p3: t % 5 === 0 ? KEY.UP : 0 }));
+			if (server.tick % 3 === 0) client.client.onSnapshot(server.snapshot());
+			client.client.stepTick(t % 7 === 0 ? KEY.UP : 0);
+			now += 1000 / 60;
+		}
+		// Kill-feed entries + a death explosion to age out before measuring.
+		client.client.onEvent({ kind: 'hit', player: 'p2', by: 'p1', force: 1 });
+		client.client.onEvent({ kind: 'death', player: 'p2', cause: 'bullet' });
+		// Warm-up: let camera shake and particles expire so the measured
+		// window is steady state (the feed entry lives for FEED_SECONDS).
+		for (let f = 0; f < 45; f++) {
+			client.client.renderFrame(0);
+			now += 1000 / 60;
+		}
+		return client;
+	}
+
+	it('performs zero array churn per steady-state frame', () => {
+		const client = steadyClient();
+		const spies = {
+			slice: vi.spyOn(Array.prototype, 'slice'),
+			map: vi.spyOn(Array.prototype, 'map'),
+			filter: vi.spyOn(Array.prototype, 'filter'),
+			concat: vi.spyOn(Array.prototype, 'concat'),
+			values: vi.spyOn(Map.prototype, 'values'),
+			entries: vi.spyOn(Map.prototype, 'entries')
+		};
+		// Count with plain loops: the measurement may not call the spies itself.
+		const keys = Object.keys(spies);
+		const counts = (): Record<string, number> => {
+			const out: Record<string, number> = {};
+			for (let i = 0; i < keys.length; i++) {
+				const key = keys[i] as keyof typeof spies;
+				out[key] = spies[key].mock.calls.length;
+			}
+			return out;
+		};
+		const before = counts();
+		client.client.renderFrame(0);
+		const after = counts();
+		for (const key of keys) spies[key as keyof typeof spies].mockRestore();
+		const churn: Record<string, number> = {};
+		for (let i = 0; i < keys.length; i++) {
+			const key = keys[i];
+			churn[key] = after[key] - before[key];
+		}
+		// renderFrame must reuse its arrays/labels: no map/filter/slice/values.
+		expect(churn).toEqual({
+			slice: 0,
+			map: 0,
+			filter: 0,
+			concat: 0,
+			values: 0,
+			entries: 0
+		});
+	});
+
+	it('keeps per-frame draw work constant in steady state (nothing accumulates)', () => {
+		const client = steadyClient();
+		const counts: number[] = [];
+		for (let f = 0; f < 8; f++) {
+			client.rec.ops.length = 0;
+			client.client.renderFrame(0);
+			counts.push(client.rec.ops.length);
+			now += 1000 / 60;
+		}
+		// Real work is happening (arena + tanks + HUD), and the amount of it
+		// is identical frame to frame — no leak of feed/explosion/label state.
+		expect(counts[0]).toBeGreaterThan(500);
+		expect(new Set(counts).size).toBe(1);
+	});
+});
+
+// ---- (h) tick discipline: one sim step per tick, render never steps ----
+
+describe('tank render: tick discipline', () => {
+	it('predicts movement with no snapshots, one sim step per stepTick and none per renderFrame', () => {
+		const client = makeClient(960, 540);
+		const reference = createTankSim(1337, CONFIG, PLAYERS);
+
+		// No snapshots ever arrive: local movement must still progress, and
+		// the first stepTick's movement must be on screen in the same frame.
+		client.client.stepTick(KEY.UP);
+		reference.tickOnce(inputMap({ p1: KEY.UP }));
+		client.rec.ops.length = 0;
+		client.client.renderFrame(0);
+		let hulls = hullDraws(client.rec, P1.color);
+		expect(hulls).toHaveLength(1);
+		expect(hulls[0].x).toBe(Math.round(reference.tanks[0].x));
+		const firstX = hulls[0].x;
+
+		// renderFrame renders; it never steps the sim (no double-stepping).
+		for (let f = 0; f < 10; f++) {
+			client.rec.ops.length = 0;
+			client.client.renderFrame(0);
+			hulls = hullDraws(client.rec, P1.color);
+			expect(hulls[0].x).toBe(firstX);
+		}
+
+		// The next stepTick advances exactly one tick's movement — not two.
+		client.client.stepTick(KEY.UP);
+		reference.tickOnce(inputMap({ p1: KEY.UP }));
+		client.rec.ops.length = 0;
+		client.client.renderFrame(0);
+		hulls = hullDraws(client.rec, P1.color);
+		expect(hulls[0].x).toBe(Math.round(reference.tanks[0].x));
+		expect(hulls[0].x).toBeGreaterThan(firstX); // it really moved
+
+		// The fixed loop runs the sim at the module's 60Hz tick rate.
+		expect(tankModule.defaults.tickRate).toBe(60);
+		expect(CONFIG.tickRate).toBe(60);
 	});
 });

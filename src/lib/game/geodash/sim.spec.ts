@@ -453,6 +453,147 @@ describe('geodash race results', () => {
 	});
 });
 
+// ---- race end: first finish ends the match (plan §7.3) ----
+
+describe('geodash race end (first finisher ends the match)', () => {
+	it('solo finish ends the sim on that exact tick, with finish + match-end together', () => {
+		const cfg = config({ durationTicks: 2000 }, { level: flatLevel(1200) });
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0]]);
+		sim.drainEvents();
+		let finishTick = -1;
+		let endTick = -1;
+		for (let t = 0; t < 2000 && endTick < 0; t++) {
+			sim.tickOnce(mapOf(['p1', frame(0)]));
+			for (const ev of sim.drainEvents()) {
+				if (ev.kind === 'finish') {
+					finishTick = t;
+					expect(ev.player).toBe('p1');
+				}
+				if (ev.kind === 'match-end') endTick = t;
+			}
+		}
+		// 1200px at 8.5px/tick: the cube crosses the finish during tick 142.
+		expect(finishTick).toBe(141);
+		expect(endTick).toBe(finishTick); // same tick, not the 2000-tick timer
+		expect(sim.finished).toBe(true);
+		expect(sim.tick).toBe(finishTick + 1);
+		const results = sim.results();
+		expect(results).toHaveLength(1);
+		expect(results[0].placement).toBe(1);
+		expect(results[0].stats['progressPercent']).toBe(100);
+		expect(results[0].stats['timeMs']).toBe(Math.round(finishTick * (1000 / 60)));
+		expect(results[0].score).toBeGreaterThanOrEqual(1000);
+
+		// The finishing player froze: the final snapshot is clean and stable.
+		const frozenX = player(sim).x;
+		const endHash = sim.hash();
+		for (let t = 0; t < 10; t++) sim.tickOnce(new Map());
+		expect(player(sim).x).toBe(frozenX);
+		expect(sim.hash()).toBe(endHash);
+		expect(sim.snapshot()['finished']).toBe(true);
+	});
+
+	it('ends at the first finish; the rest are ranked by progress at that moment', () => {
+		const level = testLevel(
+			[
+				{ type: 'block', x: 0, y: 0, w: 1600, h: 80 },
+				{ type: 'spike', x: 400, y: -40 }
+			],
+			1400
+		);
+		const cfg = config({ durationTicks: 2000 }, { level });
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0], PLAYERS[1]]);
+		sim.drainEvents();
+
+		// p1 clears the spike, p2 runs into it over and over.
+		const jumpOverSpike = (id: PlayerId): number => {
+			const p = player(sim, id);
+			if (!p.onGround) return 0;
+			return 409 - p.x > 0 && 409 - p.x <= 150 ? KEY.JUMP : 0;
+		};
+
+		let endTick = -1;
+		for (let t = 0; t < 2000 && endTick < 0; t++) {
+			sim.tickOnce(mapOf(['p1', frame(jumpOverSpike('p1'))], ['p2', frame(0)]));
+			for (const ev of sim.drainEvents()) if (ev.kind === 'match-end') endTick = t;
+		}
+		// p1 crosses 1400px at 8.5px/tick on the 165th tick (t = 164).
+		expect(endTick).toBe(164);
+		expect(sim.tick).toBe(165); // ended well before the 2000-tick timer
+		expect(player(sim, 'p1').finished).toBe(true);
+		expect(player(sim, 'p2').finished).toBe(false);
+
+		const results = sim.results();
+		expect(results.map((r) => r.player)).toEqual(['p1', 'p2']);
+		expect(results.map((r) => r.placement)).toEqual([1, 2]);
+		expect(results[0].stats['timeMs']).toBe(Math.round(endTick * (1000 / 60)));
+		expect(results[0].stats['progressPercent']).toBe(100);
+		// p2 ranked by the progress he actually had when p1 finished.
+		expect(results[1].stats['timeMs']).toBe(Math.round(sim.tick * (1000 / 60)));
+		expect(results[1].stats['deaths']).toBeGreaterThan(0);
+		expect(results[1].stats['progressPercent']).toBeGreaterThan(0);
+		expect(results[1].stats['progressPercent']).toBeLessThan(100);
+		expect(results[0].score).toBeGreaterThan(results[1].score);
+	});
+
+	it('timer expiry with nobody finished ranks everyone by progress', () => {
+		const level = testLevel(
+			[
+				{ type: 'block', x: 0, y: 0, w: 1600, h: 80 },
+				{ type: 'spike', x: 400, y: -40 }
+			],
+			1400
+		);
+		const cfg = config({ durationTicks: 100 }, { level });
+		const sim = createGeodashSim(1, cfg, [PLAYERS[0], PLAYERS[1]]);
+		sim.drainEvents();
+		let ends = 0;
+		for (let t = 0; t < 120; t++) {
+			// p1 clears the spike and keeps running; p2 dies on it. Nobody can
+			// reach the 1400px finish inside 100 ticks (850px max), so the
+			// timer must end the match and rank by progress.
+			const p1 = player(sim, 'p1');
+			const keys = p1.onGround && 409 - p1.x > 0 && 409 - p1.x <= 150 ? KEY.JUMP : 0;
+			sim.tickOnce(mapOf(['p1', frame(keys)], ['p2', frame(0)]));
+			for (const ev of sim.drainEvents()) if (ev.kind === 'match-end') ends++;
+		}
+		expect(ends).toBe(1);
+		expect(sim.finished).toBe(true);
+		expect(sim.tick).toBe(100); // ended at durationTicks, not earlier
+		const results = sim.results();
+		expect(results.map((r) => r.player)).toEqual(['p1', 'p2']);
+		expect(results.map((r) => r.placement)).toEqual([1, 2]);
+		expect(results[0].stats['progressPercent']).toBeGreaterThan(
+			results[1].stats['progressPercent']
+		);
+		for (const r of results) expect(r.stats['progressPercent']).toBeLessThan(100);
+	});
+
+	it('results rank finishers by finish time, then unfinished by progress (plan §7.3)', () => {
+		const cfg = config({ durationTicks: 600 }, { level: flatLevel() });
+		const sim = createGeodashSim(1, cfg, PLAYERS);
+		// Manufacture an end state where two players finished at different
+		// times and one never did: the ranking rule is finish time first,
+		// then furthest progress.
+		const snap = parseGeoDashSnapshot(sim.snapshot());
+		expect(snap).not.toBeNull();
+		const byId = new Map(snap!.players.map((p) => [p.id, p]));
+		Object.assign(byId.get('p2')!, { finished: true, finishTimeMs: 4200, maxProgress: 1 });
+		Object.assign(byId.get('p1')!, { finished: true, finishTimeMs: 5000, maxProgress: 1 });
+		Object.assign(byId.get('p3')!, { finished: false, finishTimeMs: 0, maxProgress: 0.42 });
+		sim.restore(snap!);
+
+		const results = sim.results();
+		expect(results.map((r) => r.player)).toEqual(['p2', 'p1', 'p3']);
+		expect(results.map((r) => r.placement)).toEqual([1, 2, 3]);
+		expect(results[0].stats['timeMs']).toBe(4200);
+		expect(results[1].stats['timeMs']).toBe(5000);
+		expect(results[2].stats['progressPercent']).toBe(42);
+		expect(results[0].score).toBeGreaterThan(results[1].score);
+		expect(results[1].score).toBeGreaterThan(results[2].score);
+	});
+});
+
 // ---- countdown + lifecycle ----
 
 describe('geodash countdown and match lifecycle', () => {

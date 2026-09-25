@@ -8,14 +8,24 @@
 import { describe, expect, it } from 'vitest';
 import type { GeoDashMode, GeoDashObject } from './level-types';
 import {
+	GRID,
 	blockSize,
+	orbBox,
+	padRect,
 	parseGeoDashLevel,
+	portalGate,
 	spikeHitbox,
 	validateGeoDashLevel,
 	type GeoDashLevel
 } from './level-types';
 import { LEVELS, getLevel } from './levels';
-import { createGeodashSim, type GeoDashPlayerState } from './sim';
+import {
+	BASE_SPEED,
+	GRAVITY,
+	JUMP_VELOCITY,
+	createGeodashSim,
+	type GeoDashPlayerState
+} from './sim';
 import { KEY } from '../types';
 
 // ---- validation ----
@@ -345,4 +355,190 @@ describe('geodash level beatability (auto-play bot)', () => {
 			expect(result.deathCauses, `${level.id} deaths`).toEqual([]);
 		});
 	}
+});
+
+// ---- pit legality: no unjumpable or unmarked pits ----
+
+/**
+ * The largest floor gap (in world px) a plain cube jump at BASE_SPEED clears
+ * from the ledge edge. Probed against the real sim by the tests below: 300px
+ * lands on the far lip, 304px crashes into it. Every wider pit must be
+ * explicitly crossed: bridged by a pad/orb before it, or passed overhead
+ * (a ceiling slab spans the pit in a ship/ball section — level-5/6 cross
+ * their big ball-run pits upside-down along the ceiling).
+ */
+const MAX_PLAIN_JUMP_GAP = 300;
+
+/** Air distance of one pad launch in px (arc time x run speed). */
+function padLaunchDistance(power: number): number {
+	return ((2 * Math.abs(JUMP_VELOCITY) * power) / GRAVITY) * BASE_SPEED;
+}
+
+type Span = { x0: number; x1: number };
+
+/** Merge touching/overlapping block spans (per pick predicate) into one list. */
+function mergedBlockSpans(
+	level: GeoDashLevel,
+	pick: (obj: Extract<GeoDashObject, { type: 'block' }>) => boolean
+): Span[] {
+	const spans: Span[] = [];
+	for (const obj of level.objects) {
+		if (obj.type !== 'block' || !pick(obj)) continue;
+		const { w } = blockSize(obj);
+		spans.push({ x0: obj.x, x1: obj.x + w });
+	}
+	spans.sort((a, b) => a.x0 - b.x0);
+	const merged: Span[] = [];
+	for (const span of spans) {
+		const last = merged[merged.length - 1];
+		if (last && span.x0 <= last.x1) last.x1 = Math.max(last.x1, span.x1);
+		else merged.push({ ...span });
+	}
+	return merged;
+}
+
+/** Floor gaps: holes in the ground coverage (blocks at/under the ground line). */
+function floorGaps(level: GeoDashLevel): Span[] {
+	const gaps: Span[] = [];
+	let cursor = 0;
+	for (const seg of mergedBlockSpans(level, (obj) => obj.y >= 0)) {
+		if (seg.x0 > cursor) gaps.push({ x0: cursor, x1: seg.x0 });
+		cursor = Math.max(cursor, seg.x1);
+	}
+	if (cursor < level.lengthPx) gaps.push({ x0: cursor, x1: level.lengthPx });
+	return gaps;
+}
+
+/** How a floor gap is legally crossed, or null when it is an unmarked pit. */
+function pitBridge(level: GeoDashLevel, gap: Span): string | null {
+	const width = gap.x1 - gap.x0;
+	// (a) short enough to clear with a plain cube jump at base speed.
+	if (width <= MAX_PLAIN_JUMP_GAP) return 'plain jump';
+	// (b) explicitly bridged by a pad just before the pit (launch clears it)...
+	for (const obj of level.objects) {
+		if (obj.type !== 'pad') continue;
+		if (obj.x < gap.x0 - 260 || obj.x > gap.x0) continue;
+		if (padLaunchDistance(obj.power) >= width + 60) return `pad@${obj.x}`;
+	}
+	// ...or by an orb over the pit (one air jump mid-arc).
+	for (const obj of level.objects) {
+		if (obj.type !== 'orb') continue;
+		if (obj.x < gap.x0 - 80 || obj.x > gap.x1 + 80) continue;
+		if (obj.y >= -260 && obj.y <= -40) return `orb@${obj.x}`;
+	}
+	// (c) crossed overhead: a ceiling slab spans the pit with lip room on both
+	// sides, so a ship flies or a ball rolls above the missing floor.
+	const from = gap.x0 - 100;
+	const to = gap.x1 + 100;
+	if (
+		mergedBlockSpans(level, (obj) => obj.type === 'block' && obj.y + blockSize(obj).h <= -150).some(
+			(seg) => seg.x0 <= from && seg.x1 >= to
+		)
+	) {
+		return 'overhead';
+	}
+	return null;
+}
+
+/** Run a real edge jump across a synthetic `gap`-wide pit; return the outcome. */
+function edgeJumpGapOutcome(gap: number): string {
+	const x0 = 800;
+	const level: GeoDashLevel = {
+		id: 'gap-probe',
+		name: 'Gap Probe',
+		difficulty: 1,
+		bpm: 120,
+		lengthPx: x0 + gap + 1800,
+		objects: [
+			{ type: 'block', x: 0, y: 0, w: x0, h: 80 },
+			{ type: 'block', x: x0 + gap, y: 0, w: 2000, h: 80 }
+		]
+	};
+	const sim = createGeodashSim(
+		1,
+		{ tickRate: 60, durationTicks: 400, options: { countdownTicks: 0, level } },
+		[{ id: 'bot', name: 'Bot', color: '#fff', slot: 0 }]
+	);
+	// Press JUMP on the last grounded tick at the ledge edge, then coast.
+	let jumped = false;
+	for (let t = 0; t < 300; t++) {
+		const p = sim.players[0];
+		const keys = !jumped && p.x >= x0 - 1 ? KEY.JUMP : 0;
+		if (keys) jumped = true;
+		sim.tickOnce(new Map([['bot', { keys }]]));
+		for (const ev of sim.drainEvents()) if (ev.kind === 'death') return ev.cause;
+		if (jumped && p.onGround && p.x > x0 + gap) return 'landed';
+	}
+	return 'timeout';
+}
+
+describe('geodash level pits are legal', () => {
+	it('documents the max plain-jump gap: 300px lands on the far lip, 304px is fatal', () => {
+		expect(edgeJumpGapOutcome(160)).toBe('landed');
+		expect(edgeJumpGapOutcome(MAX_PLAIN_JUMP_GAP)).toBe('landed');
+		expect(edgeJumpGapOutcome(MAX_PLAIN_JUMP_GAP + 4)).not.toBe('landed');
+		expect(edgeJumpGapOutcome(400)).not.toBe('landed');
+	});
+
+	it('every floor gap is plain-jumpable, bridged by a pad/orb, or crossed overhead', () => {
+		for (const level of LEVELS) {
+			const gaps = floorGaps(level);
+			for (const gap of gaps) {
+				const bridge = pitBridge(level, gap);
+				expect(
+					bridge,
+					`${level.id}: unmarked pit [${gap.x0}, ${gap.x1}] (${Math.round(gap.x1 - gap.x0)}px) is neither plain-jumpable nor bridged`
+				).not.toBeNull();
+			}
+		}
+	});
+
+	it('deco, saws, pads, orbs and portals never overwrite a floor block', () => {
+		const footprint = (
+			obj: GeoDashObject
+		): { x: number; y: number; w: number; h: number } | null => {
+			switch (obj.type) {
+				case 'block':
+					return null;
+				case 'spike':
+					return spikeHitbox(obj);
+				case 'saw': {
+					const r = obj.r ?? 22;
+					return { x: obj.x - r, y: obj.y - r, w: r * 2, h: r * 2 };
+				}
+				case 'pad':
+					return padRect(obj);
+				case 'orb':
+					return orbBox(obj);
+				case 'speed':
+				case 'gravity':
+					// the drawn portal bar: 16 wide, 120 tall down from its anchor
+					return { x: obj.x - 2, y: obj.y, w: 16, h: 120 };
+				case 'portal':
+					return portalGate(obj);
+				case 'deco':
+					return { x: obj.x, y: obj.y, w: GRID, h: GRID };
+			}
+		};
+		for (const level of LEVELS) {
+			const floors = level.objects
+				.filter(
+					(obj): obj is Extract<GeoDashObject, { type: 'block' }> =>
+						obj.type === 'block' && obj.y >= 0
+				)
+				.map((obj) => ({ x: obj.x, y: obj.y, ...blockSize(obj) }));
+			for (const obj of level.objects) {
+				const rect = footprint(obj);
+				if (!rect) continue;
+				for (const floor of floors) {
+					const overlap =
+						rect.x < floor.x + floor.w &&
+						floor.x < rect.x + rect.w &&
+						rect.y < floor.y + floor.h &&
+						floor.y < rect.y + rect.h;
+					expect(overlap, `${level.id}: ${obj.type}@${obj.x} overwrites the floor`).toBe(false);
+				}
+			}
+		}
+	});
 });

@@ -11,9 +11,11 @@ import type { GameContext, SimPlayer } from '../types';
 import { KEY } from '../types';
 import type { Camera } from '../engine/camera';
 import { PixelCanvas, type Canvas2DLike, type CanvasSourceLike } from '../engine/gfx';
-import { createGeodashClient, type GeoDashClient } from './render';
+import { blockSize } from './level-types';
+import type { GeoDashLevel, GeoDashMode } from './level-types';
+import { LEVELS } from './levels';
+import { createGeodashClient, paletteForDifficulty, type GeoDashClient } from './render';
 import type { GeoDashSim } from './sim';
-import type { GeoDashMode } from './level-types';
 
 // ---- recording fake draw backend (see engine/gfx.spec.ts for the full one) ----
 
@@ -198,7 +200,7 @@ interface ClientInternals {
 }
 
 function makeClient(
-	canvas: FakeCanvas,
+	canvas: CanvasSourceLike,
 	levelId = 'level-1',
 	level?: Record<string, unknown>
 ): { client: GeoDashClient; internals: ClientInternals } {
@@ -498,6 +500,244 @@ describe('geodash form sprites and mode portals', () => {
 		const veil = canvas.ctx.fillOps.filter((o) => o.style === '#6ec6ff');
 		expect(veil.length, 'tinted veil drawn').toBeGreaterThan(0);
 		expectFullyPainted(canvas.ctx, 'transform flash frame');
+		client.stop();
+	});
+});
+
+// ---- floor slabs stay painted at every camera x ----
+// (user report: "the platform floor disappears sometimes"). Floor slabs are
+// single blocks thousands of pixels wide; draw culling must keep them for the
+// whole visible x range at any camera position/zoom and any canvas size. The
+// recording backend below tracks only fills of the floor-slab color and is
+// cheap enough to sweep every ~20 world px of every level.
+
+/** Records transformed rects of ONE fill style; everything else is ignored. */
+class FloorRecorder2D implements Canvas2DLike {
+	fillStyle = '#000000';
+	strokeStyle = '#000000';
+	lineWidth = 1;
+	imageSmoothingEnabled = false;
+	globalAlpha = 1;
+
+	/** Device-space rects painted in the watched style. */
+	fills: { x0: number; y0: number; x1: number; y1: number }[] = [];
+
+	private readonly watch: string;
+	private matrix: Matrix = [1, 0, 0, 1, 0, 0];
+	private stack: Matrix[] = [];
+
+	constructor(watch: string) {
+		this.watch = watch;
+	}
+
+	clearFills(): void {
+		this.fills = [];
+	}
+
+	save(): void {
+		this.stack.push([...this.matrix] as Matrix);
+	}
+
+	restore(): void {
+		this.matrix = this.stack.pop() ?? this.matrix;
+	}
+
+	setTransform(a: number, b: number, c: number, d: number, e: number, f: number): void {
+		this.matrix = [a, b, c, d, e, f];
+	}
+
+	translate(x: number, y: number): void {
+		this.concat([1, 0, 0, 1, x, y]);
+	}
+
+	scale(x: number, y: number): void {
+		this.concat([x, 0, 0, y, 0, 0]);
+	}
+
+	rotate(angle: number): void {
+		const c = Math.cos(angle);
+		const s = Math.sin(angle);
+		this.concat([c, s, -s, c, 0, 0]);
+	}
+
+	clearRect(): void {}
+
+	fillRect(x: number, y: number, w: number, h: number): void {
+		if (this.fillStyle !== this.watch) return;
+		const [a, b, c, d, e, f] = this.matrix;
+		const xs = [
+			a * x + c * y + e,
+			a * (x + w) + c * y + e,
+			a * x + c * (y + h) + e,
+			a * (x + w) + c * (y + h) + e
+		];
+		const ys = [
+			b * x + d * y + f,
+			b * (x + w) + d * y + f,
+			b * x + d * (y + h) + f,
+			b * (x + w) + d * (y + h) + f
+		];
+		this.fills.push({
+			x0: Math.min(...xs),
+			y0: Math.min(...ys),
+			x1: Math.max(...xs),
+			y1: Math.max(...ys)
+		});
+	}
+
+	strokeRect(): void {}
+	beginPath(): void {}
+	closePath(): void {}
+	moveTo(): void {}
+	lineTo(): void {}
+	arc(): void {}
+	fill(): void {}
+	stroke(): void {}
+	drawImage(): void {}
+
+	private concat(m: Matrix): void {
+		const [a, b, c, d, e, f] = this.matrix;
+		const [na, nb, nc, nd, ne, nf] = m;
+		this.matrix = [
+			a * na + c * nb,
+			b * na + d * nb,
+			a * nc + c * nd,
+			b * nc + d * nd,
+			a * ne + c * nf + e,
+			b * ne + d * nf + f
+		];
+	}
+}
+
+class FloorCanvas implements CanvasSourceLike {
+	readonly ctx: FloorRecorder2D;
+	width: number;
+	height: number;
+
+	constructor(width: number, height: number, watch: string) {
+		this.width = width;
+		this.height = height;
+		this.ctx = new FloorRecorder2D(watch);
+	}
+
+	getContext(type: '2d'): Canvas2DLike | null {
+		return type === '2d' ? this.ctx : null;
+	}
+}
+
+/** Every floor block (ground slab) in the level, as rects. */
+function floorBlocks(level: GeoDashLevel): { x: number; y: number; w: number; h: number }[] {
+	const out: { x: number; y: number; w: number; h: number }[] = [];
+	for (const obj of level.objects) {
+		if (obj.type === 'block' && obj.y >= 0) out.push({ x: obj.x, y: obj.y, ...blockSize(obj) });
+	}
+	return out;
+}
+
+/**
+ * Every floor tile visible in the frame must be painted with the slab fill.
+ * Visibility is judged against the internal viewport rect (letterbox offsets
+ * included) using the POST-follow camera the frame was actually drawn with.
+ * Returns how many tiles were checked (callers guard against vacuous frames).
+ */
+function expectFloorTiles(
+	rec: FloorRecorder2D,
+	internals: ClientInternals,
+	level: GeoDashLevel,
+	at: string
+): number {
+	const pixel = internals.pixel;
+	const cam = internals.camera;
+	const zoom = cam.zoom * pixel.scale;
+	const viewLeft = pixel.offsetX;
+	const viewTop = pixel.offsetY;
+	const viewRight = pixel.offsetX + 480 * pixel.scale;
+	const viewBottom = pixel.offsetY + 270 * pixel.scale;
+	const floors = floorBlocks(level);
+	// Sample the whole visible x range (zoom-aware) densely, every 20px.
+	const reach = Math.ceil(280 / cam.zoom);
+	let checked = 0;
+	for (let wx = Math.floor(cam.x - reach); wx <= cam.x + reach; wx += 20) {
+		const slab = floors.find((b) => wx >= b.x && wx < b.x + b.w);
+		if (!slab) continue; // a pit: intentionally no floor here
+		const wy = slab.y + Math.min(20, slab.h / 2);
+		const sx = (wx - cam.x) * zoom + 240 * pixel.scale + pixel.offsetX;
+		const sy = (wy - cam.y) * zoom + 135 * pixel.scale + pixel.offsetY;
+		if (sx < viewLeft || sx >= viewRight || sy < viewTop || sy >= viewBottom) continue;
+		checked++;
+		// The fill rect and the probe point are computed through different
+		// float paths; allow a hair of rounding at the edges.
+		const eps = 0.01;
+		const painted = rec.fills.some(
+			(f) => f.x0 - eps <= sx && sx < f.x1 + eps && f.y0 - eps <= sy && sy < f.y1 + eps
+		);
+		expect(
+			painted,
+			`${at}: floor tile at world x=${wx} not painted (screen ${sx.toFixed(1)},${sy.toFixed(1)})`
+		).toBe(true);
+	}
+	return checked;
+}
+
+const FLOOR_SIZES: [number, number][] = [
+	[480, 270],
+	[960, 540],
+	[200, 120],
+	[320, 900]
+];
+
+const FLOOR_CAMERA_YS = [0, -110, 65];
+
+describe('geodash floor slabs paint every visible tile at every camera x', () => {
+	for (const level of LEVELS) {
+		for (const [w, h] of FLOOR_SIZES) {
+			it(`${level.id} "${level.name}" at ${w}x${h}`, () => {
+				const ground = paletteForDifficulty(level.difficulty).ground;
+				const canvas = new FloorCanvas(w, h, ground);
+				const { client, internals } = makeClient(canvas, level.id);
+				client.resize(w, h);
+				let sample = 0;
+				let checked = 0;
+				for (let cx = -300; cx <= level.lengthPx + 300; cx += 20) {
+					const camY = FLOOR_CAMERA_YS[sample++ % FLOOR_CAMERA_YS.length];
+					internals.camera.setPosition(cx, camY);
+					canvas.ctx.clearFills();
+					internals.onRender(0);
+					checked += expectFloorTiles(
+						canvas.ctx,
+						internals,
+						level,
+						`${level.id} @${w}x${h} camera(${cx},${camY})`
+					);
+				}
+				expect(checked, `${level.id} @${w}x${h}: sweep was vacuous`).toBeGreaterThan(20);
+				client.stop();
+			});
+		}
+	}
+
+	it('the floor stays painted through zoom-out and zoom-in', () => {
+		const level = LEVELS[2];
+		const ground = paletteForDifficulty(level.difficulty).ground;
+		const canvas = new FloorCanvas(800, 600, ground);
+		const { client, internals } = makeClient(canvas, level.id);
+		client.resize(800, 600);
+		let checked = 0;
+		for (const zoom of [0.5, 0.75, 1, 1.4]) {
+			internals.camera.zoom = zoom;
+			for (let cx = -400; cx <= level.lengthPx + 400; cx += 60) {
+				internals.camera.setPosition(cx, 0);
+				canvas.ctx.clearFills();
+				internals.onRender(0);
+				checked += expectFloorTiles(
+					canvas.ctx,
+					internals,
+					level,
+					`${level.id} zoom ${zoom} @${cx}`
+				);
+			}
+		}
+		expect(checked, `${level.id} zoom sweep was vacuous`).toBeGreaterThan(20);
 		client.stop();
 	});
 });

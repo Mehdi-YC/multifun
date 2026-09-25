@@ -19,8 +19,11 @@
  * 3 ticks, pads launch, orbs give one air jump each per attempt, blocks land
  * on top / kill on side contact, spikes and saws kill, pits kill below the
  * fall line. Death = full restart at x = 0 (attempt counter++). Finish at
- * x >= level.lengthPx. Everything is seeded/derived from inputs only: no
- * Math.random, no Date.
+ * x >= level.lengthPx. The race (plan §7.3) ends on the tick the FIRST
+ * player finishes — remaining players are ranked by the progress they had
+ * at that moment — or when durationTicks expires, whichever comes first.
+ * Finished players freeze in place so the final snapshot is clean.
+ * Everything is seeded/derived from inputs only: no Math.random, no Date.
  */
 import type {
 	GameConfig,
@@ -341,6 +344,10 @@ class GeoDashSimulation implements GameSim {
 		return this.currentTick;
 	}
 
+	/**
+	 * True once the race is over: the first player finished, everyone is
+	 * done, or durationTicks expired (whichever happened first).
+	 */
 	get finished(): boolean {
 		return this.done;
 	}
@@ -366,8 +373,13 @@ class GeoDashSimulation implements GameSim {
 		}
 
 		this.currentTick++;
-		const allFinished = this.states.length > 0 && this.states.every((p) => p.finished);
-		if (allFinished || this.currentTick >= this.durationTicks) {
+		// Race end (plan §7.3): the match is over the tick the FIRST player
+		// crosses the finish (their `finish` event already fired above), when
+		// everyone is done, or when the duration expires — whichever comes
+		// first. Solo play therefore ends instantly on finish and the platform
+		// gets `match-end` + results right away.
+		const anyFinished = this.states.some((p) => p.finished);
+		if (anyFinished || this.currentTick >= this.durationTicks) {
 			this.done = true;
 			this.events.push({ kind: 'match-end' });
 		}
