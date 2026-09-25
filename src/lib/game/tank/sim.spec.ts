@@ -9,8 +9,15 @@ import type { GameConfig, InputFrame, PlayerId, SimPlayer } from '../types';
 import { KEY } from '../types';
 import {
 	BULLET_LIFE,
+	EFFECT_TICKS,
 	INVULN_TICKS,
+	POWERUP_GRACE_TICKS,
+	POWERUP_KINDS,
+	POWERUP_MAX_ALIVE,
+	POWERUP_SPAWN_INTERVAL,
 	RESPAWN_TICKS,
+	SPEED_MULTIPLIER,
+	TRIPLE_SHOTS,
 	XP_PER_HIT,
 	XP_PER_KILL,
 	bulletSpeed,
@@ -18,10 +25,14 @@ import {
 	levelForXp,
 	maxBounces,
 	parseTankSnapshot,
+	rapidReloadTicks,
 	reloadTicks,
 	speedScale,
+	type PowerupKind,
+	type PowerupState,
 	type TankSim
 } from './sim';
+import { tileAtPx } from './arena';
 
 const P1: SimPlayer = { id: 'p1', name: 'Ada', color: '#ff5c7a', slot: 0 };
 const P2: SimPlayer = { id: 'p2', name: 'Ben', color: '#57e389', slot: 1 };
@@ -541,5 +552,285 @@ describe('tank sim match flow', () => {
 		sim.tickOnce(new Map());
 		expect(sim.hash()).toBe(endHash);
 		expect(sim.drainEvents()).toHaveLength(0);
+	});
+});
+
+describe('tank sim power-ups', () => {
+	const LONG: GameConfig = {
+		tickRate: 60,
+		durationTicks: 1600,
+		options: { arenaId: 'crossfire', countdownTicks: 0 }
+	};
+
+	/** Drive straight into the crate at tile (4, 2) until it is destroyed. */
+	function destroyFirstCrate(sim: TankSim): void {
+		place(sim, 'p1', 72, 100, -Math.PI / 2);
+		place(sim, 'p2', 300, 24, 0);
+		sim.tanks[0].invulnTimer = 10000; // own returning shells must not kill
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 15; i++) sim.tickOnce(new Map());
+		sim.tanks[0].reloadTimer = 0;
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 15; i++) sim.tickOnce(new Map());
+		expect(sim.crateHp[2 * 30 + 4]).toBe(0);
+	}
+
+	it('same seed spawns the identical power-up sequence (seeded rng only)', () => {
+		const config: GameConfig = { ...CONFIG, durationTicks: 1200 };
+		const a = createTankSim(SEED, config, PLAYERS);
+		const b = createTankSim(SEED, config, PLAYERS);
+		const stream = makeStream(config.durationTicks);
+		const spawnsA: string[] = [];
+		for (const frame of stream) {
+			a.tickOnce(frame);
+			b.tickOnce(frame);
+			expect(a.hash()).toBe(b.hash());
+			expect(a.powerups).toEqual(b.powerups);
+			for (const p of a.powerups) {
+				const key = `${p.id}:${p.kind}@${p.x},${p.y},${p.born}`;
+				if (!spawnsA.includes(key)) spawnsA.push(key);
+			}
+		}
+		// The stream is long enough to exercise the cadence and crate drops.
+		expect(spawnsA.length).toBeGreaterThanOrEqual(2);
+	});
+
+	it('spawns one every 300 ticks on free floor tiles, capped at 4 alive', () => {
+		const sim = createTankSim(SEED, LONG, [P1, P2]);
+		sim.drainEvents();
+		for (let i = 0; i < POWERUP_SPAWN_INTERVAL; i++) sim.tickOnce(new Map());
+		expect(sim.powerups).toHaveLength(0); // nothing before tick 300 completes
+		sim.tickOnce(new Map());
+		expect(sim.powerups).toHaveLength(1);
+
+		const first = sim.powerups[0];
+		expect(POWERUP_KINDS as readonly string[]).toContain(first.kind);
+		expect(first.born).toBe(POWERUP_SPAWN_INTERVAL);
+		// Free floor tile — never inside walls/water/crates/tanks/bullets.
+		expect(tileAtPx(sim.arena, first.x, first.y)).toBe('floor');
+		for (const t of sim.tanks) {
+			expect(Math.hypot(t.x - first.x, t.y - first.y)).toBeGreaterThan(24 - 0.001);
+		}
+
+		for (let i = 0; i < POWERUP_SPAWN_INTERVAL * 4; i++) sim.tickOnce(new Map());
+		expect(sim.powerups).toHaveLength(POWERUP_MAX_ALIVE);
+		expect(sim.powerups.map((p) => p.born)).toEqual([300, 600, 900, 1200]);
+		// The 1500 spawn is skipped while the map is at the cap.
+		expect(sim.powerups).toHaveLength(POWERUP_MAX_ALIVE);
+	});
+
+	it.each(['shield', 'triple', 'rapid', 'speed'] as const)(
+		'collecting %s after its 1s grace applies the effect and emits collect',
+		(kind: PowerupKind) => {
+			const sim = createTankSim(SEED, LONG, [P1, P2]);
+			sim.drainEvents();
+			for (let i = 0; i <= POWERUP_SPAWN_INTERVAL; i++) sim.tickOnce(new Map());
+			expect(sim.powerups).toHaveLength(1);
+			const pickup = sim.powerups[0] as PowerupState;
+			pickup.kind = kind; // deterministic override so every kind is covered
+
+			// Park p2 on the pickup: the grace must hold it safe first.
+			const t2 = sim.tanks[1];
+			t2.x = pickup.x;
+			t2.y = pickup.y;
+			for (let i = 0; i < POWERUP_GRACE_TICKS - 1; i++) sim.tickOnce(new Map());
+			expect(sim.powerups).toHaveLength(1); // visible < 1s: untouchable
+			expect(sim.drainEvents().filter((e) => e.kind === 'collect')).toHaveLength(0);
+
+			sim.tickOnce(new Map()); // exactly 1s old now: grabbable
+			expect(sim.powerups).toHaveLength(0);
+			const events = sim.drainEvents();
+			expect(
+				events.filter((e) => e.kind === 'collect' && e.item === `powerup:${kind}`)
+			).toHaveLength(1);
+			expect(t2.shield).toBe(kind === 'shield' ? 1 : 0);
+			expect(t2.triple).toBe(kind === 'triple' ? TRIPLE_SHOTS : 0);
+			expect(t2.rapidTimer).toBe(kind === 'rapid' ? EFFECT_TICKS : 0);
+			expect(t2.speedTimer).toBe(kind === 'speed' ? EFFECT_TICKS : 0);
+		}
+	);
+
+	it('shield absorbs exactly one shell (hit force 0, no life lost) and is gone', () => {
+		const sim = createTankSim(SEED, CONFIG, [P1, P2]);
+		sim.drainEvents();
+		place(sim, 'p1', 100, 24, 0);
+		place(sim, 'p2', 200, 24, 0);
+		sim.tanks[1].shield = 1;
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 30 && sim.tanks[1].shield > 0; i++) sim.tickOnce(new Map());
+
+		expect(sim.tanks[1].shield).toBe(0);
+		expect(sim.tanks[1].lives).toBe(2);
+		expect(sim.tanks[1].deaths).toBe(0);
+		expect(sim.tanks[1].alive).toBe(true);
+		const events = sim.drainEvents();
+		const hits = events.filter((e) => e.kind === 'hit');
+		expect(hits).toHaveLength(1);
+		expect(hits[0]).toMatchObject({ player: 'p2', by: 'p1', force: 0 });
+		expect(events.filter((e) => e.kind === 'death')).toHaveLength(0);
+
+		// Second shell: the bubble is spent, this one kills.
+		sim.tanks[0].reloadTimer = 0;
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 30 && sim.tanks[1].lives === 2; i++) sim.tickOnce(new Map());
+		expect(sim.tanks[1].lives).toBe(1);
+		const second = sim.drainEvents();
+		expect(second.filter((e) => e.kind === 'hit' && e.force === 1)).toHaveLength(1);
+		expect(second.filter((e) => e.kind === 'death')).toHaveLength(1);
+	});
+
+	it('triple fires a 3-way spread for exactly 5 shots, then single shells', () => {
+		const sim = createTankSim(SEED, CONFIG, [P1, P2]);
+		sim.drainEvents();
+		// Row-1 lane (y=28): clear floor, and the spread misses the top wall.
+		place(sim, 'p1', 100, 28, 0);
+		place(sim, 'p2', 350, 28, 0);
+		sim.tanks[0].triple = TRIPLE_SHOTS;
+
+		const volleys: number[] = [];
+		for (let shot = 0; shot < 6; shot++) {
+			sim.tanks[0].reloadTimer = 0;
+			const before = sim.bullets.length;
+			sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+			volleys.push(sim.bullets.length - before);
+		}
+		expect(volleys).toEqual([3, 3, 3, 3, 3, 1]);
+		expect(sim.tanks[0].triple).toBe(0);
+		expect(sim.tanks[0].reloadTimer).toBe(reloadTicks(1));
+
+		// The spread fans out symmetrically around the hull angle.
+		const [left, straight, right] = sim.bullets;
+		expect(left.vy).toBeLessThan(0);
+		expect(straight.vy).toBe(0);
+		expect(right.vy).toBeGreaterThan(0);
+		expect(straight.vx).toBeCloseTo(bulletSpeed(1), 10);
+	});
+
+	it('rapid divides the reload by three for 8s, then lapses (no expiry events)', () => {
+		const sim = createTankSim(SEED, CONFIG, [P1, P2]);
+		sim.drainEvents();
+		// Row-1 lane (y=28): open floor all the way to the border wall.
+		place(sim, 'p1', 100, 28, 0);
+		place(sim, 'p2', 350, 28, 0);
+		sim.tanks[0].invulnTimer = 100000; // own returning shells must not kill
+		sim.tanks[1].invulnTimer = 100000; // shells pass through: match must run on
+		sim.tanks[0].rapidTimer = EFFECT_TICKS;
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		expect(sim.tanks[0].reloadTimer).toBe(rapidReloadTicks(1)); // 45 / 3 = 15
+
+		for (let i = 0; i < 14; i++) sim.tickOnce(inputMap({ p1: 0 }));
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		expect(sim.bullets.length).toBe(2); // second shot only 15 ticks later
+
+		sim.tanks[0].reloadTimer = 0;
+		for (let i = 0; i < EFFECT_TICKS - 20; i++) sim.tickOnce(inputMap({ p1: 0 }));
+		expect(sim.tanks[0].rapidTimer).toBeGreaterThan(0);
+		for (let i = 0; i < 20; i++) sim.tickOnce(inputMap({ p1: 0 }));
+		expect(sim.tanks[0].rapidTimer).toBe(0);
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		expect(sim.tanks[0].reloadTimer).toBe(reloadTicks(1)); // back to 45
+		expect(sim.drainEvents().filter((e) => e.kind === 'collect')).toHaveLength(0);
+	});
+
+	it('speed adds 40% drive for 8s, then lapses', () => {
+		const sim = createTankSim(SEED, CONFIG, [P1, P2]);
+		sim.drainEvents();
+		place(sim, 'p1', 200, 100, 0);
+		place(sim, 'p2', 350, 24, 0);
+		sim.tanks[0].speedTimer = EFFECT_TICKS;
+
+		const start = sim.tanks[0].x;
+		sim.tickOnce(inputMap({ p1: KEY.UP }));
+		expect(sim.tanks[0].x - start).toBeCloseTo(2.2 * SPEED_MULTIPLIER, 5);
+		expect(sim.tanks[0].speedTimer).toBe(EFFECT_TICKS - 1);
+
+		// Explicit idle input (an empty map would keep the last keys driving).
+		for (let i = 0; i < EFFECT_TICKS; i++) sim.tickOnce(inputMap({ p1: 0 }));
+		expect(sim.tanks[0].speedTimer).toBe(0);
+		const before = sim.tanks[0].x;
+		sim.tickOnce(inputMap({ p1: KEY.UP }));
+		expect(sim.tanks[0].x - before).toBeCloseTo(2.2, 5);
+	});
+
+	it('destroyed crates drop power-ups ~half the time (seeded, replay-stable)', () => {
+		const dropCount = (): number => {
+			let drops = 0;
+			for (let seedIndex = 0; seedIndex < 30; seedIndex++) {
+				const sim = createTankSim(SEED + seedIndex * 101, CONFIG, [P1, P2]);
+				sim.drainEvents();
+				destroyFirstCrate(sim);
+				expect(
+					sim.drainEvents().filter((e) => e.kind === 'collect' && e.item === 'crate')
+				).toHaveLength(1);
+				if (sim.powerups.length > 0) {
+					drops++;
+					const drop = sim.powerups[0];
+					expect(POWERUP_KINDS as readonly string[]).toContain(drop.kind);
+					expect(Math.abs(drop.x - (4 * 16 + 8))).toBeLessThan(0.001); // crate tile
+				}
+			}
+			return drops;
+		};
+		const drops = dropCount();
+		expect(drops).toBeGreaterThanOrEqual(8);
+		expect(drops).toBeLessThanOrEqual(22);
+		expect(dropCount()).toBe(drops); // identical on replay
+	});
+
+	it('effects and map power-ups ride snapshot/restore/hash; restore erases divergence', () => {
+		const config: GameConfig = { ...CONFIG, durationTicks: 1200 };
+		const a = createTankSim(SEED, config, PLAYERS);
+		for (let i = 0; i <= POWERUP_SPAWN_INTERVAL; i++) a.tickOnce(new Map());
+		expect(a.powerups.length).toBeGreaterThan(0);
+		a.tanks[0].shield = 1;
+		a.tanks[0].triple = 3;
+		a.tanks[0].rapidTimer = 200;
+		a.tanks[0].speedTimer = 100;
+		const snap = a.snapshot();
+		const hashAtSnap = a.hash();
+
+		const b = createTankSim(SEED + 7, config, PLAYERS); // different seed scatter
+		b.restore(snap);
+		expect(b.hash()).toBe(hashAtSnap);
+		expect(b.powerups).toEqual(a.powerups);
+		expect(b.tanks[0]).toMatchObject({ shield: 1, triple: 3, rapidTimer: 200, speedTimer: 100 });
+
+		// Diverge b's effects and pickups: the hash must notice...
+		b.tanks[0].shield = 0;
+		b.tanks[0].rapidTimer = 0;
+		b.powerups[0].born += 1;
+		expect(b.hash()).not.toBe(hashAtSnap);
+		// ...and a restore erases every trace of the divergence.
+		b.restore(snap);
+		expect(b.hash()).toBe(hashAtSnap);
+		expect(b.powerups).toEqual(a.powerups);
+		expect(b.tanks[0]).toMatchObject({ shield: 1, triple: 3, rapidTimer: 200, speedTimer: 100 });
+	});
+
+	it('dying drops every transient effect (the wreck keeps nothing)', () => {
+		const sim = createTankSim(SEED, CONFIG, [P1, P2]);
+		sim.drainEvents();
+		place(sim, 'p1', 100, 24, 0);
+		place(sim, 'p2', 200, 24, 0);
+		const victim = sim.tanks[1];
+		victim.shield = 1;
+		victim.triple = 2;
+		victim.rapidTimer = 100;
+		victim.speedTimer = 100;
+
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 30 && victim.shield > 0; i++) sim.tickOnce(new Map());
+		expect(victim.shield).toBe(0); // absorbed: alive, effects intact
+		expect(victim.alive).toBe(true);
+		expect(victim.triple).toBe(2);
+
+		sim.tanks[0].reloadTimer = 0;
+		sim.tickOnce(inputMap({ p1: KEY.JUMP }));
+		for (let i = 0; i < 30 && victim.alive; i++) sim.tickOnce(new Map());
+		expect(victim.alive).toBe(false);
+		expect(victim.triple).toBe(0);
+		expect(victim.rapidTimer).toBe(0);
+		expect(victim.speedTimer).toBe(0);
+		expect(victim.shield).toBe(0);
 	});
 });

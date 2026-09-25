@@ -8,6 +8,7 @@ import { createTankSim } from './sim';
 import { createTankClient } from './render';
 
 export * from './arena';
+export * from './interp';
 export * from './sim';
 export * from './render';
 

@@ -348,7 +348,8 @@ muzzle flashes and tread animation, `reducedMotion` respected.
 - **AI bots** to fill lobbies / solo play (spline-free: steering + LOS targeting, reuse the kart AI
   plan), difficulty levels.
 - Team deathmatch (2 teams), capture-the-flag variant, sudden-death shrinking arena.
-- Power-up crates (rapid fire, shield, mine), more arenas + a procedural daily arena.
+- ~~Power-up crates~~ **done**: random map upgrades (shield / triple shot / rapid fire / speed) with
+  deterministic spawns + crate drops. More upgrade types welcome.
 - Meta progression: unlockable tank skins (avatar system already stores `avatarJson`).
 
 ---
@@ -667,3 +668,13 @@ Notes from building Phase 0 (keep updated per milestone):
   hold-JUMP thrust, ball = tap-JUMP flips gravity; `transform` events on the wire; 6 levels with a
   mode-aware beatability bot (0-deaths first attempts). Level/arena pickers in the lobby settings
   modal make all content reachable from the UI.
+- **Tank desync (2-browser report) was 3 bugs:** ① the client render clock used the LOCAL sim tick
+  while the snapshot buffer is keyed by SERVER ticks — dropped ticks (heavier windows) skewed the
+  offset, so screens drifted apart (remote rendering now uses a snapshot-derived clock +
+  reconciliation); ② interpolation slid across respawn teleports (now snaps on discontinuities;
+  discrete lives/respawn/invuln state comes straight from samples); ③ naive angle lerp spun the long
+  way across the ±π seam (now shortest-path everywhere). Wire-level check: two live clients get
+  byte-identical snapshots per tick. **Caution for other games:** any client-side timing keyed off
+  local loop ticks has hazard ① — geodash/echo should adopt the snapshot-clock pattern too.
+- **Tank map upgrades shipped:** random deterministic spawns (shield / triple shot / rapid fire /
+  speed) + crate drops, 1s fairness grace, effects live in sim state (snapshots/hash), HUD timers.

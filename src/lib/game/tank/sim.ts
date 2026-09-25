@@ -9,12 +9,24 @@
  * shorten reloads, accelerate bullets and give level-5 shells two bounces.
  * Last tank with lives left wins, or the clock decides.
  *
+ * Random upgrades: power-ups (`shield`, `triple`, `rapid`, `speed`) pop up on
+ * the map every 300 ticks (and from destroyed crates, 50%) at seeded-rng-chosen
+ * free floor tiles, and are collected by driving over them. Effects live in the
+ * sim (timers and counters on each tank, part of snapshot/restore/hash), so
+ * every client and the server agree on them without any protocol change:
+ * pickups emit `collect {item:'powerup:<id>'}`, a shield eating a shell emits
+ * `hit` with `force: 0` (documented choice: the existing event kind doubles as
+ * "absorbed" — no life is lost, no `death` follows), and no expiry events are
+ * emitted at all because effect timers travel in the snapshot for VFX.
+ *
  * Determinism: no Date, no Math.random — everything is fixed-timestep math and
- * one stateful mulberry32 seeded from `seed` (used for spawn scatter and
- * respawn placement; its state is captured by snapshot/restore). Hull angles
- * are continuous floats in radians (0 = facing +x, growing clockwise with the
- * screen's y-down axis); Math.cos/sin are used per tick, so bit-identical
- * replay holds on a single JS engine (all our client/server run V8).
+ * one stateful mulberry32 seeded from `seed` (used for spawn scatter, respawn
+ * placement and power-up spawns/drops; its state is captured by
+ * snapshot/restore). Hull angles are continuous floats in radians (0 = facing
+ * +x, growing clockwise with the screen's y-down axis) and are interpolated
+ * with shortest-path wrapping on the client (see `interp.ts`); Math.cos/sin are
+ * used per tick, so bit-identical replay holds on a single JS engine (all our
+ * client/server run V8).
  */
 import type {
 	GameConfig,
@@ -34,6 +46,7 @@ import {
 	isBulletSolid,
 	isTankSolid,
 	tileAt,
+	tileCenter,
 	type Arena,
 	type ArenaPoint
 } from './arena';
@@ -71,6 +84,39 @@ export const MAX_LEVEL = 5;
 export const DEFAULT_COUNTDOWN_TICKS = 120;
 /** Ticks between tank center and muzzle tip where bullets spawn. */
 export const TURRET_LENGTH = 12;
+
+// ---- power-up tuning (see the header; ids are exactly shield/triple/rapid/speed) ----
+
+export const POWERUP_KINDS = ['shield', 'triple', 'rapid', 'speed'] as const;
+export type PowerupKind = (typeof POWERUP_KINDS)[number];
+
+/** Ticks between automatic power-up spawns (300 = 5s at 60Hz). */
+export const POWERUP_SPAWN_INTERVAL = 300;
+/** Maximum power-ups alive on the map at once. */
+export const POWERUP_MAX_ALIVE = 4;
+/**
+ * Ticks a pickup must sit visible on the map before anyone may grab it (60 =
+ * 1s). Fairness rule: no pickup can change a fight (or a spawn-adjacent brawl)
+ * before every screen has shown it for at least a second.
+ */
+export const POWERUP_GRACE_TICKS = 60;
+/** Tank-center distance that collects a pickup. */
+export const POWERUP_PICKUP_RADIUS = 12;
+/** Shots remaining after grabbing `triple` (the next 5 shots spread 3-way). */
+export const TRIPLE_SHOTS = 5;
+/** Half-angle of the 3-way spread in radians (~10 degrees). */
+export const TRIPLE_SPREAD = 0.18;
+/** Duration of `rapid` and `speed` in ticks (480 = 8s at 60Hz). */
+export const EFFECT_TICKS = 480;
+/** Drive speed multiplier while `speed` is active (+40%). */
+export const SPEED_MULTIPLIER = 1.4;
+/** Chance a destroyed crate drops a power-up. */
+export const CRATE_DROP_CHANCE = 0.5;
+
+/** Reload ticks while `rapid` is active: base reload divided by 3 (min 1). */
+export function rapidReloadTicks(level: number): number {
+	return Math.max(1, Math.round(reloadTicks(level) / 3));
+}
 
 export function levelForXp(xp: number): number {
 	let level = 1;
@@ -124,6 +170,30 @@ export type TankState = {
 	alive: boolean;
 	/** Last input seen; disconnected players keep driving with it. */
 	lastKeys: number;
+	/** 1 when the shield bubble is up (absorbs the next shell hit). */
+	shield: number;
+	/** `triple` shots left: each shot fires a 3-way spread. */
+	triple: number;
+	/** Ticks of rapid fire (reload / 3) left. */
+	rapidTimer: number;
+	/** Ticks of +40% drive speed left. */
+	speedTimer: number;
+};
+
+/**
+ * A map pickup. Kinds are exactly `shield`, `triple`, `rapid`, `speed`.
+ * `born` is the spawn tick — pickups can only be collected after
+ * `POWERUP_GRACE_TICKS` of visibility (fairness, see the tuning block).
+ */
+export type PowerupState = {
+	/** Stable identity for snapshot/interpolation maps. */
+	id: number;
+	kind: PowerupKind;
+	/** Center in world pixels (a free floor tile's center). */
+	x: number;
+	y: number;
+	/** Tick the pickup appeared on the map. */
+	born: number;
 };
 
 export type BulletState = {
@@ -149,6 +219,10 @@ export type TankSnapshot = {
 	bullets: BulletState[];
 	/** Per-tile crate hit points (0 = no crate / destroyed). */
 	crates: number[];
+	/** Power-ups currently on the map. */
+	powerups: PowerupState[];
+	/** Identity generator for power-ups (restored for determinism). */
+	nextPowerupId: number;
 };
 
 /** GameSim plus read-only live views used by tests and the renderer. */
@@ -157,6 +231,7 @@ export type TankSim = GameSim & {
 	readonly tanks: readonly TankState[];
 	readonly bullets: readonly BulletState[];
 	readonly crateHp: readonly number[];
+	readonly powerups: readonly PowerupState[];
 	readonly countdownTicks: number;
 };
 
@@ -233,7 +308,11 @@ function readTank(source: Record<string, unknown>): TankState | null {
 		respawnTimer: readNumber(source, 'respawnTimer'),
 		invulnTimer: readNumber(source, 'invulnTimer'),
 		alive: readBool(source, 'alive'),
-		lastKeys: readNumber(source, 'lastKeys')
+		lastKeys: readNumber(source, 'lastKeys'),
+		shield: readNumber(source, 'shield'),
+		triple: readNumber(source, 'triple'),
+		rapidTimer: readNumber(source, 'rapidTimer'),
+		speedTimer: readNumber(source, 'speedTimer')
 	};
 }
 
@@ -248,6 +327,18 @@ function readBullet(source: Record<string, unknown>): BulletState | null {
 		vy: readNumber(source, 'vy'),
 		life: readNumber(source, 'life'),
 		bounces: readNumber(source, 'bounces')
+	};
+}
+
+function readPowerup(source: Record<string, unknown>): PowerupState | null {
+	const kind = source['kind'];
+	if (typeof kind !== 'string' || !POWERUP_KINDS.includes(kind as PowerupKind)) return null;
+	return {
+		id: readNumber(source, 'id'),
+		kind: kind as PowerupKind,
+		x: readNumber(source, 'x'),
+		y: readNumber(source, 'y'),
+		born: readNumber(source, 'born')
 	};
 }
 
@@ -280,6 +371,16 @@ export function parseTankSnapshot(state: GameStatePatch): TankSnapshot | null {
 		if (typeof entry !== 'number' || !Number.isFinite(entry)) return null;
 		crates.push(entry);
 	}
+	// Power-ups are optional on the wire (older payloads predate them).
+	const rawPowerups = state['powerups'] ?? [];
+	if (!Array.isArray(rawPowerups)) return null;
+	const powerups: PowerupState[] = [];
+	for (const entry of rawPowerups) {
+		if (typeof entry !== 'object' || entry === null) return null;
+		const parsed = readPowerup(entry as Record<string, unknown>);
+		if (!parsed) return null;
+		powerups.push(parsed);
+	}
 	return {
 		tick,
 		finished: state['finished'] === true,
@@ -287,7 +388,9 @@ export function parseTankSnapshot(state: GameStatePatch): TankSnapshot | null {
 		nextBulletId: readNumber(state, 'nextBulletId'),
 		tanks,
 		bullets,
-		crates
+		crates,
+		powerups,
+		nextPowerupId: readNumber(state, 'nextPowerupId')
 	};
 }
 
@@ -301,6 +404,7 @@ class TankSimulation implements TankSim {
 	private readonly byId = new Map<PlayerId, TankState>();
 	private readonly shotList: BulletState[] = [];
 	private readonly crateList: number[];
+	private readonly powerupList: PowerupState[] = [];
 	private readonly events: GameEvent[] = [];
 	private readonly rng: SimRng;
 	private readonly durationTicks: number;
@@ -309,6 +413,7 @@ class TankSimulation implements TankSim {
 	private currentTick = 0;
 	private done = false;
 	private nextBulletId = 1;
+	private nextPowerupId = 1;
 
 	constructor(seed: number, config: GameConfig, players: SimPlayer[]) {
 		this.arena = getArena(String(config.options['arenaId'] ?? 'crossfire'));
@@ -349,7 +454,11 @@ class TankSimulation implements TankSim {
 				respawnTimer: 0,
 				invulnTimer: 0,
 				alive: true,
-				lastKeys: 0
+				lastKeys: 0,
+				shield: 0,
+				triple: 0,
+				rapidTimer: 0,
+				speedTimer: 0
 			};
 			this.states.push(state);
 			this.byId.set(state.id, state);
@@ -375,6 +484,10 @@ class TankSimulation implements TankSim {
 
 	get crateHp(): readonly number[] {
 		return this.crateList;
+	}
+
+	get powerups(): readonly PowerupState[] {
+		return this.powerupList;
 	}
 
 	tickOnce(inputs: Map<PlayerId, InputFrame>): void {
@@ -408,6 +521,9 @@ class TankSimulation implements TankSim {
 			}
 		}
 
+		this.spawnPowerups();
+		this.collectPowerups();
+
 		this.currentTick++;
 		const withLives = this.states.filter((t) => t.lives > 0).length;
 		if ((this.states.length > 0 && withLives <= 1) || this.currentTick >= this.durationTicks) {
@@ -428,7 +544,9 @@ class TankSimulation implements TankSim {
 			nextBulletId: this.nextBulletId,
 			tanks: this.states.map((t) => ({ ...t })),
 			bullets: this.shotList.map((b) => ({ ...b })),
-			crates: this.crateList.slice()
+			crates: this.crateList.slice(),
+			powerups: this.powerupList.map((p) => ({ ...p })),
+			nextPowerupId: this.nextPowerupId
 		};
 	}
 
@@ -439,6 +557,7 @@ class TankSimulation implements TankSim {
 		this.done = snap.finished;
 		this.rng.state = snap.rngState | 0;
 		this.nextBulletId = snap.nextBulletId | 0;
+		this.nextPowerupId = Math.max(1, snap.nextPowerupId | 0);
 		const byId = new Map(snap.tanks.map((t) => [t.id, t]));
 		for (const target of this.states) {
 			const src = byId.get(target.id);
@@ -447,6 +566,8 @@ class TankSimulation implements TankSim {
 		}
 		this.shotList.length = 0;
 		for (const b of snap.bullets) this.shotList.push({ ...b });
+		this.powerupList.length = 0;
+		for (const p of snap.powerups) this.powerupList.push({ ...p });
 		for (let i = 0; i < this.crateList.length; i++) {
 			this.crateList[i] = i < snap.crates.length ? snap.crates[i] : this.crateList[i];
 		}
@@ -480,6 +601,7 @@ class TankSimulation implements TankSim {
 		h = fnvByte(h, this.done ? 1 : 0);
 		h = fnvInt(h, this.rng.state);
 		h = fnvInt(h, this.nextBulletId);
+		h = fnvInt(h, this.nextPowerupId);
 		for (const t of this.states) {
 			h = fnvInt(h, quantize(t.x));
 			h = fnvInt(h, quantize(t.y));
@@ -496,6 +618,10 @@ class TankSimulation implements TankSim {
 			h = fnvInt(h, t.invulnTimer);
 			h = fnvInt(h, t.lastKeys);
 			h = fnvByte(h, t.alive ? 1 : 0);
+			h = fnvInt(h, t.shield);
+			h = fnvInt(h, t.triple);
+			h = fnvInt(h, t.rapidTimer);
+			h = fnvInt(h, t.speedTimer);
 		}
 		for (const b of this.shotList) {
 			h = fnvInt(h, b.id);
@@ -506,6 +632,13 @@ class TankSimulation implements TankSim {
 			h = fnvInt(h, b.life);
 			h = fnvInt(h, b.bounces);
 		}
+		for (const p of this.powerupList) {
+			h = fnvInt(h, p.id);
+			h = fnvInt(h, POWERUP_KINDS.indexOf(p.kind));
+			h = fnvInt(h, quantize(p.x));
+			h = fnvInt(h, quantize(p.y));
+			h = fnvInt(h, p.born);
+		}
 		for (const hp of this.crateList) h = fnvInt(h, hp);
 		return h >>> 0;
 	}
@@ -514,6 +647,9 @@ class TankSimulation implements TankSim {
 
 	private updateTank(tank: TankState, keys: number, frozen: boolean): void {
 		if (tank.invulnTimer > 0) tank.invulnTimer--;
+		// Timed effects lapse through death too (death clears them anyway).
+		if (tank.rapidTimer > 0) tank.rapidTimer--;
+		if (tank.speedTimer > 0) tank.speedTimer--;
 
 		if (!tank.alive) {
 			if (tank.lives > 0 && tank.respawnTimer > 0) {
@@ -530,12 +666,13 @@ class TankSimulation implements TankSim {
 		if ((keys & KEY.RIGHT) !== 0) tank.angle += TURN_PER_TICK;
 
 		let speed = 0;
+		const drive = speedScale(tank.level) * (tank.speedTimer > 0 ? SPEED_MULTIPLIER : 1);
 		if ((keys & KEY.UP) !== 0) {
 			tank.moveDir = 1;
-			speed = BASE_FORWARD_SPEED * speedScale(tank.level);
+			speed = BASE_FORWARD_SPEED * drive;
 		} else if ((keys & KEY.DOWN) !== 0) {
 			tank.moveDir = -1;
-			speed = BASE_REVERSE_SPEED * speedScale(tank.level);
+			speed = BASE_REVERSE_SPEED * drive;
 		}
 		if (speed !== 0) {
 			const dx = Math.cos(tank.angle) * speed * tank.moveDir;
@@ -547,21 +684,33 @@ class TankSimulation implements TankSim {
 		if ((keys & KEY.JUMP) !== 0 && tank.reloadTimer <= 0) this.fire(tank);
 	}
 
+	/**
+	 * Fire one shell — or a 3-way spread while `triple` has shots left.
+	 * `rapid` shortens the reload; both counters here are sim state, so every
+	 * client predicts the same shells from the same snapshots.
+	 */
 	private fire(tank: TankState): void {
-		const dx = Math.cos(tank.angle);
-		const dy = Math.sin(tank.angle);
 		const speed = bulletSpeed(tank.level);
-		this.shotList.push({
-			id: this.nextBulletId++,
-			owner: tank.id,
-			x: tank.x + dx * TURRET_LENGTH,
-			y: tank.y + dy * TURRET_LENGTH,
-			vx: dx * speed,
-			vy: dy * speed,
-			life: BULLET_LIFE,
-			bounces: 0
-		});
-		tank.reloadTimer = reloadTicks(tank.level);
+		const angles =
+			tank.triple > 0
+				? [tank.angle - TRIPLE_SPREAD, tank.angle, tank.angle + TRIPLE_SPREAD]
+				: [tank.angle];
+		for (const angle of angles) {
+			const dx = Math.cos(angle);
+			const dy = Math.sin(angle);
+			this.shotList.push({
+				id: this.nextBulletId++,
+				owner: tank.id,
+				x: tank.x + dx * TURRET_LENGTH,
+				y: tank.y + dy * TURRET_LENGTH,
+				vx: dx * speed,
+				vy: dy * speed,
+				life: BULLET_LIFE,
+				bounces: 0
+			});
+		}
+		if (tank.triple > 0) tank.triple--;
+		tank.reloadTimer = tank.rapidTimer > 0 ? rapidReloadTicks(tank.level) : reloadTicks(tank.level);
 	}
 
 	private respawn(tank: TankState): void {
@@ -756,6 +905,11 @@ class TankSimulation implements TankSim {
 		this.crateList[index]--;
 		if (this.crateList[index] === 0) {
 			this.events.push({ kind: 'collect', player: owner, item: 'crate' });
+			// Destroyed crates may drop a power-up (seeded 50%, respects the cap).
+			if (this.rng.next() < CRATE_DROP_CHANCE && this.powerupList.length < POWERUP_MAX_ALIVE) {
+				const kind = POWERUP_KINDS[Math.floor(this.rng.next() * POWERUP_KINDS.length)];
+				this.addPowerup(kind, tileCenter(col, row), this.currentTick);
+			}
 		}
 	}
 
@@ -763,12 +917,26 @@ class TankSimulation implements TankSim {
 	 * One bullet hit = one life lost. The shooter earns damage + xp; the kill
 	 * and the bigger xp prize only pay out when the hit eliminates the victim.
 	 * Self-hits count (classic and funny).
+	 *
+	 * A `shield` charge absorbs exactly one shell instead: no life is lost, no
+	 * xp is paid, and the hit is signalled with the existing `hit` event at
+	 * `force: 0` (deliberate protocol choice — see the file header) so every
+	 * client can pop the bubble without a new event kind.
 	 */
 	private hitTank(tank: TankState, shooterId: PlayerId): void {
+		if (tank.shield > 0) {
+			tank.shield = 0;
+			this.events.push({ kind: 'hit', player: tank.id, by: shooterId, force: 0 });
+			return;
+		}
 		tank.lives = Math.max(0, tank.lives - 1);
 		tank.deaths++;
 		tank.alive = false;
 		tank.moveDir = 0;
+		// The wreck drops every transient effect (shield is already spent above).
+		tank.triple = 0;
+		tank.rapidTimer = 0;
+		tank.speedTimer = 0;
 		this.events.push({ kind: 'hit', player: tank.id, by: shooterId, force: 1 });
 		this.events.push({ kind: 'death', player: tank.id, cause: 'bullet' });
 
@@ -790,6 +958,102 @@ class TankSimulation implements TankSim {
 			});
 		} else {
 			tank.respawnTimer = RESPAWN_TICKS;
+		}
+	}
+
+	// ---- power-ups ----
+
+	/** Deterministic cadence: one spawn every POWERUP_SPAWN_INTERVAL ticks. */
+	private spawnPowerups(): void {
+		if (this.currentTick === 0 || this.currentTick % POWERUP_SPAWN_INTERVAL !== 0) return;
+		if (this.powerupList.length >= POWERUP_MAX_ALIVE) return;
+		const candidates = this.freePowerupTiles();
+		if (candidates.length === 0) return;
+		const spot = candidates[Math.floor(this.rng.next() * candidates.length)];
+		const kind = POWERUP_KINDS[Math.floor(this.rng.next() * POWERUP_KINDS.length)];
+		this.addPowerup(kind, spot, this.currentTick);
+	}
+
+	/**
+	 * Floor tiles a pickup may appear on: never inside walls/water/crates, and
+	 * never under tanks, bullets or other pickups (nobody gets one dropped on
+	 * their head mid-fight).
+	 */
+	private freePowerupTiles(): ArenaPoint[] {
+		const out: ArenaPoint[] = [];
+		for (let row = 0; row < this.arena.rows; row++) {
+			for (let col = 0; col < this.arena.cols; col++) {
+				if (tileAt(this.arena, col, row) !== 'floor') continue;
+				const spot = tileCenter(col, row);
+				if (this.powerupSpotFree(spot)) out.push(spot);
+			}
+		}
+		return out;
+	}
+
+	private powerupSpotFree(spot: ArenaPoint): boolean {
+		for (const tank of this.states) {
+			if (!tank.alive) continue;
+			const dx = tank.x - spot.x;
+			const dy = tank.y - spot.y;
+			if (dx * dx + dy * dy < 24 * 24) return false;
+		}
+		for (const b of this.shotList) {
+			const dx = b.x - spot.x;
+			const dy = b.y - spot.y;
+			if (dx * dx + dy * dy < 12 * 12) return false;
+		}
+		for (const p of this.powerupList) {
+			const dx = p.x - spot.x;
+			const dy = p.y - spot.y;
+			if (dx * dx + dy * dy < 24 * 24) return false;
+		}
+		return true;
+	}
+
+	private addPowerup(kind: PowerupKind, spot: ArenaPoint, born: number): void {
+		this.powerupList.push({
+			id: this.nextPowerupId++,
+			kind,
+			x: spot.x,
+			y: spot.y,
+			born
+		});
+	}
+
+	/** Driving over a pickup collects it once its grace ticks have passed. */
+	private collectPowerups(): void {
+		for (let i = this.powerupList.length - 1; i >= 0; i--) {
+			const powerup = this.powerupList[i];
+			if (this.currentTick - powerup.born < POWERUP_GRACE_TICKS) continue;
+			const radius2 = POWERUP_PICKUP_RADIUS * POWERUP_PICKUP_RADIUS;
+			const tank = this.states.find((t) => {
+				if (!t.alive) return false;
+				const dx = t.x - powerup.x;
+				const dy = t.y - powerup.y;
+				return dx * dx + dy * dy <= radius2;
+			});
+			if (!tank) continue;
+			this.applyPowerup(tank, powerup.kind);
+			this.powerupList.splice(i, 1);
+			this.events.push({ kind: 'collect', player: tank.id, item: `powerup:${powerup.kind}` });
+		}
+	}
+
+	private applyPowerup(tank: TankState, kind: PowerupKind): void {
+		switch (kind) {
+			case 'shield':
+				tank.shield = 1;
+				break;
+			case 'triple':
+				tank.triple = Math.min(TRIPLE_SHOTS, tank.triple + TRIPLE_SHOTS);
+				break;
+			case 'rapid':
+				tank.rapidTimer = EFFECT_TICKS;
+				break;
+			case 'speed':
+				tank.speedTimer = EFFECT_TICKS;
+				break;
 		}
 	}
 }

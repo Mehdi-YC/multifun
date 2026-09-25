@@ -4,6 +4,20 @@
  * by local input, and interpolates remote tanks/bullets from server snapshots
  * buffered ~100ms in the past. The camera is pinned to the arena (the whole
  * 30x17 map is visible) and only shakes on explosions.
+ *
+ * Desync hardening (see `interp.ts` for the buffer details):
+ * - All world drawing happens in internal 480x270 pixel coordinates; the
+ *   PixelCanvas letterbox scale/offset is never read here, so two browsers
+ *   with wildly different window sizes draw every entity at identical
+ *   internal coordinates.
+ * - Remote entities are rendered at a render tick derived from the SNAPSHOT
+ *   stream's own ticks (not the local loop's tick count), so a browser that
+ *   drops ticks under render load still shows the same world position as one
+ *   that keeps up. The interpolation buffer snaps (never slides) across
+ *   respawns/deaths and rebase-style corrections.
+ * - The local prediction is reconciled against every authoritative snapshot
+ *   (`sim.restore` + local-input replay). Small corrections blend (with
+ *   shortest-path angle blending), big jumps snap; see `reconcile()`.
  */
 import type {
 	GameClient,
@@ -20,19 +34,27 @@ import { InputManager } from '../engine/input';
 import { FixedTimestepLoop } from '../engine/loop';
 import { Camera } from '../engine/camera';
 import { ParticleSystem } from '../engine/particles';
-import { nowMs } from '../engine/fixed';
+import { clamp, nowMs } from '../engine/fixed';
 import { mulberry32 } from '../engine/rng';
 import { TILE_SIZE, tileAt } from './arena';
 import {
 	BULLET_LIFE,
+	EFFECT_TICKS,
+	TRIPLE_SHOTS,
+	TRIPLE_SPREAD,
 	TANK_HALF,
 	createTankSim,
 	parseTankSnapshot,
+	rapidReloadTicks,
 	reloadTicks,
 	type BulletState,
+	type PowerupKind,
+	type PowerupState,
 	type TankSim,
+	type TankSnapshot,
 	type TankState
 } from './sim';
+import { RemoteBuffer, SNAP_DISTANCE, angleDelta, wrapAngle } from './interp';
 
 // ---- palette ----
 
@@ -60,25 +82,43 @@ const PANEL_EDGE = '#1a1c2c';
 const BULLET_CORE = '#ffe066';
 const BULLET_TRAIL = '#ff9f43';
 
-const MAX_REMOTE_SAMPLES = 32;
 const FEED_SECONDS = 4.5;
+/** Bounded local-input history used to replay prediction after a restore. */
+const MAX_INPUT_LOG = 120;
+/** Exponential smoothing rate (per second) for prediction-correction blending. */
+const CORRECTION_DECAY = 14;
 
-/** GameClient plus canvas fitting (GameShell calls it via optional cast). */
+/** Colors for the four power-up pickups (shared by map icons and HUD). */
+const POWERUP_COLORS: Record<PowerupKind, string> = {
+	shield: '#6ec6ff',
+	triple: '#ffd166',
+	rapid: '#ffe066',
+	speed: '#57e389'
+};
+
+/** GameClient plus canvas fitting and deterministic driving (tests + loop). */
 export interface TankClient extends GameClient {
+	/** Tank snapshots always carry remote state — required, not optional. */
+	onSnapshot(patch: GameStatePatch): void;
+	/** Server events drive shared VFX/SFX on every client. */
+	onEvent(ev: GameEvent): void;
 	/** Fit the canvas backing store (internal resolution stays 480x270). */
 	resize(cssWidth: number, cssHeight: number): void;
+	/**
+	 * Advance the local prediction by one fixed tick (what the game loop calls;
+	 * pass `keys` to override input sampling in deterministic tests).
+	 */
+	stepTick(keys?: number): void;
+	/** Render one frame at interpolation alpha (what the game loop calls). */
+	renderFrame(alpha: number): void;
 }
-
-type RemoteSample = {
-	tick: number;
-	tanks: Map<PlayerId, TankState>;
-	bullets: Map<number, BulletState>;
-	crates: number[];
-};
 
 type Explosion = { x: number; y: number; age: number; life: number; size: number; color: string };
 type Burst = { x: number; y: number; age: number; life: number };
 type FeedEntry = { killer: string; victim: string; age: number };
+
+/** Display-only correction of the predicted self tank toward snapshot truth. */
+type SelfOffset = { x: number; y: number; angle: number };
 
 class TankClientImpl implements TankClient {
 	private readonly ctx: GameContext;
@@ -94,7 +134,15 @@ class TankClientImpl implements TankClient {
 	private readonly tickInputs = new Map<PlayerId, InputFrame>();
 	private readonly playersById: Map<PlayerId, SimPlayer>;
 
-	private readonly remoteSamples: RemoteSample[] = [];
+	/** Authoritative snapshot stream driving all remote-entity rendering. */
+	private readonly buffer = new RemoteBuffer();
+	/** Local input history (keys per prediction tick) for restore replay. */
+	private readonly inputLog: number[] = [];
+	/** Display-only smoothing of prediction corrections (see `reconcile`). */
+	private selfOffset: SelfOffset = { x: 0, y: 0, angle: 0 };
+	/** nowMs() when the newest snapshot was applied (render clock anchor). */
+	private lastSnapMs = nowMs();
+
 	private readonly explosions: Explosion[] = [];
 	private readonly bursts: Burst[] = [];
 	private readonly feed: FeedEntry[] = [];
@@ -133,8 +181,8 @@ class TankClientImpl implements TankClient {
 		this.particles = new ParticleSystem({ capacity: 256, rng: mulberry32(0xc0ffee) });
 		this.loop = new FixedTimestepLoop({
 			tickRate: ctx.config.tickRate,
-			onTick: () => this.onTick(),
-			onRender: (alpha) => this.onRender(alpha)
+			onTick: () => this.stepTick(),
+			onRender: (alpha) => this.renderFrame(alpha)
 		});
 	}
 
@@ -155,16 +203,61 @@ class TankClientImpl implements TankClient {
 		this.pixel.resize(cssWidth, cssHeight);
 	}
 
-	/** Server snapshots carry every tank + shell; we interpolate the remotes. */
+	/**
+	 * Server snapshots carry every tank, shell and power-up. They feed the
+	 * interpolation buffer (whose continuity flags snap across respawns and
+	 * teleports) and reconcile the local prediction against authority.
+	 */
 	onSnapshot(patch: GameStatePatch): void {
 		const snap = parseTankSnapshot(patch);
 		if (!snap) return;
-		const tanks = new Map<PlayerId, TankState>();
-		for (const t of snap.tanks) tanks.set(t.id, t);
-		const bullets = new Map<number, BulletState>();
-		for (const b of snap.bullets) bullets.set(b.id, b);
-		this.remoteSamples.push({ tick: snap.tick, tanks, bullets, crates: snap.crates });
-		if (this.remoteSamples.length > MAX_REMOTE_SAMPLES) this.remoteSamples.shift();
+		this.buffer.push(snap);
+		this.lastSnapMs = nowMs();
+		this.reconcile(snap);
+	}
+
+	/**
+	 * Prediction reconciliation: restore the private sim to the authoritative
+	 * snapshot, then replay the local inputs recorded since. Applying the
+	 * snapshot REBASES both the sim and the interpolation display: small
+	 * corrections blend out over ~150ms (angles always the short way around),
+	 * while a teleport, death, respawn or lives change snaps instantly — a
+	 * correction must never slide the tank across the map either.
+	 */
+	private reconcile(snap: TankSnapshot): void {
+		const selfBefore = this.sim.tanks.find((t) => t.id === this.ctx.selfId) ?? null;
+		const before = selfBefore
+			? {
+					x: selfBefore.x,
+					y: selfBefore.y,
+					angle: selfBefore.angle,
+					alive: selfBefore.alive,
+					lives: selfBefore.lives
+				}
+			: null;
+		const steps = Math.max(0, Math.min(this.sim.tick - snap.tick, this.inputLog.length));
+		this.sim.restore(snap);
+		for (let i = this.inputLog.length - steps; i < this.inputLog.length; i++) {
+			this.tickInputs.set(this.ctx.selfId, { keys: this.inputLog[i] });
+			this.sim.tickOnce(this.tickInputs);
+		}
+		// Prediction events are display noise; the server's event stream owns VFX.
+		this.sim.drainEvents();
+
+		const selfAfter = this.sim.tanks.find((t) => t.id === this.ctx.selfId) ?? null;
+		if (!before || !selfAfter) return;
+		const jump = Math.hypot(selfAfter.x - before.x, selfAfter.y - before.y);
+		const rebased =
+			jump > SNAP_DISTANCE || selfAfter.alive !== before.alive || selfAfter.lives !== before.lives;
+		if (rebased) {
+			this.selfOffset = { x: 0, y: 0, angle: 0 };
+			return;
+		}
+		this.selfOffset.x += before.x - selfAfter.x;
+		this.selfOffset.y += before.y - selfAfter.y;
+		this.selfOffset.angle = wrapAngle(
+			this.selfOffset.angle + angleDelta(selfAfter.angle, before.angle)
+		);
 	}
 
 	onEvent(ev: GameEvent): void {
@@ -176,8 +269,23 @@ class TankClientImpl implements TankClient {
 				break;
 			}
 			case 'hit': {
-				this.pendingKiller.set(ev.player, ev.by);
 				const pos = this.displayTank(ev.player);
+				if (ev.force <= 0) {
+					// force 0 = shield absorbed the shell: pop the bubble, no kill.
+					if (pos) {
+						this.particles.emit({
+							kind: 'ring',
+							x: pos.x,
+							y: pos.y,
+							size: 16,
+							life: 0.3,
+							color: POWERUP_COLORS.shield
+						});
+					}
+					this.audio.sfx.click();
+					break;
+				}
+				this.pendingKiller.set(ev.player, ev.by);
 				if (pos) {
 					this.particles.emit({
 						kind: 'spark',
@@ -212,6 +320,22 @@ class TankClientImpl implements TankClient {
 				if (ev.item === 'levelup') {
 					if (pos) this.bursts.push({ x: pos.x, y: pos.y, age: 0, life: 0.7 });
 					this.audio.sfx.boost();
+				} else if (ev.item.startsWith('powerup:')) {
+					// Pickup pop: colored ring + sparkle burst + boost jingle.
+					const kind = ev.item.slice('powerup:'.length) as PowerupKind;
+					const color = POWERUP_COLORS[kind] ?? '#ffd166';
+					if (pos) {
+						this.bursts.push({ x: pos.x, y: pos.y, age: 0, life: 0.6 });
+						this.particles.emit({
+							kind: 'ring',
+							x: pos.x,
+							y: pos.y,
+							size: 18,
+							life: 0.35,
+							color
+						});
+					}
+					this.audio.sfx.boost();
 				} else {
 					this.audio.sfx.click();
 				}
@@ -233,28 +357,58 @@ class TankClientImpl implements TankClient {
 
 	// ---- fixed tick: sample input, send it, predict locally ----
 
-	private onTick(): void {
-		this.input.pollGamepads();
-		const frame = this.input.sample();
+	stepTick(keys?: number): void {
+		if (keys === undefined) this.input.pollGamepads();
+		const frame = keys === undefined ? this.input.sample() : { keys };
 		this.ctx.sendInput(frame);
 		this.tickInputs.set(this.ctx.selfId, frame);
+		// Keep the input history so snapshot restores can replay the local
+		// prediction forward instead of freezing it at snapshot time.
+		this.inputLog.push(frame.keys);
+		if (this.inputLog.length > MAX_INPUT_LOG) this.inputLog.shift();
 		this.sim.tickOnce(this.tickInputs);
 
 		// Fire blip from the local prediction (firing is not a GameEvent).
 		const self = this.sim.tanks.find((t) => t.id === this.ctx.selfId);
 		if (self && self.reloadTimer > this.prevSelfReload) this.audio.sfx.jump();
 		this.prevSelfReload = self ? self.reloadTimer : 0;
+		// Prediction events are display noise; the server's events own the VFX.
+		this.sim.drainEvents();
 	}
 
 	// ---- render ----
 
-	private onRender(alpha: number): void {
+	/**
+	 * World time in snapshot ticks for remote entities: one ~100ms delay
+	 * behind the newest snapshot, advanced by wall time since that snapshot
+	 * arrived. Derived from the SNAPSHOT stream (not the local tick counter),
+	 * so a browser that drops ticks under render load — bigger canvas, slower
+	 * machine — still renders every remote entity at the same world time as a
+	 * browser that keeps up. Falls back to the local tick before the first
+	 * snapshot arrives.
+	 */
+	private renderTick(): number {
+		const tickRate = this.ctx.config.tickRate > 0 ? this.ctx.config.tickRate : 60;
+		const delay = Math.max(1, Math.round(tickRate * 0.1));
+		const latest = this.buffer.latestTick;
+		if (latest === null) return this.sim.tick - delay;
+		const oldest = this.buffer.oldestTick ?? latest;
+		const sinceSnap = Math.max(0, (nowMs() - this.lastSnapMs) / (1000 / tickRate));
+		return clamp(latest - delay + sinceSnap, oldest, latest);
+	}
+
+	renderFrame(alpha: number): void {
 		const now = nowMs();
 		const dt = Math.min(0.1, Math.max(0, (now - this.lastFrameMs) / 1000));
 		this.lastFrameMs = now;
 		this.animFrame++;
 		this.countdownAge += dt;
 		this.particles.update(dt);
+		// Prediction corrections blend out (shortest-path angle, see reconcile).
+		const keep = Math.exp(-CORRECTION_DECAY * dt);
+		this.selfOffset.x *= keep;
+		this.selfOffset.y *= keep;
+		this.selfOffset.angle *= keep;
 		this.camera.follow(
 			(this.sim.arena.cols * TILE_SIZE) / 2,
 			(this.sim.arena.rows * TILE_SIZE) / 2,
@@ -268,6 +422,10 @@ class TankClientImpl implements TankClient {
 		this.removeExpired(this.feed, (f) => f.age >= FEED_SECONDS);
 		this.syncCrates();
 
+		// World time for everything the buffer interpolates; `alpha` only
+		// refines the pre-snapshot fallback where no snapshot clock exists.
+		const renderTick = this.renderTick() + (this.buffer.latestTick === null ? alpha : 0);
+
 		const pixel = this.pixel;
 		pixel.clear(BG);
 		pixel.ctx.save();
@@ -276,9 +434,10 @@ class TankClientImpl implements TankClient {
 		this.drawFloor();
 		this.drawWater();
 		this.drawCrates();
+		this.drawPowerups(renderTick);
 		this.drawWalls();
-		this.drawShells(alpha);
-		this.drawTanks(alpha);
+		this.drawShells(renderTick);
+		this.drawTanks(renderTick);
 		this.particles.draw(pixel.ctx);
 		this.drawEffects();
 		this.drawBushes();
@@ -317,8 +476,7 @@ class TankClientImpl implements TankClient {
 	}
 
 	private latestCrates(): number[] {
-		const last = this.remoteSamples[this.remoteSamples.length - 1];
-		return last ? last.crates : this.sim.crateHp.slice();
+		return this.buffer.latestCrates() ?? this.sim.crateHp.slice();
 	}
 
 	private spawnExplosion(x: number, y: number, trauma: number, color = '#ff9f43'): void {
@@ -331,12 +489,7 @@ class TankClientImpl implements TankClient {
 
 	/** Latest known state of a tank (snapshot first, local prediction fallback). */
 	private displayTank(id: PlayerId): TankState | null {
-		const last = this.remoteSamples[this.remoteSamples.length - 1];
-		if (last) {
-			const t = last.tanks.get(id);
-			if (t) return t;
-		}
-		return this.sim.tanks.find((t) => t.id === id) ?? null;
+		return this.buffer.latestTank(id) ?? this.sim.tanks.find((t) => t.id === id) ?? null;
 	}
 
 	// ---- arena drawing ----
@@ -444,14 +597,12 @@ class TankClientImpl implements TankClient {
 	 * Local shells come from the prediction sim (immediate); remote shells come
 	 * from the snapshot buffer. Muzzle flashes derive from young shells.
 	 */
-	private drawShells(alpha: number): void {
+	private drawShells(renderTick: number): void {
 		for (const b of this.sim.bullets) {
 			if (b.owner !== this.ctx.selfId) continue;
 			this.drawShell(b);
 		}
-		const renderTick =
-			this.sim.tick - Math.max(1, Math.round(this.ctx.config.tickRate * 0.1)) + alpha;
-		for (const b of this.remoteBullets(renderTick)) {
+		for (const b of this.buffer.bulletsAt(renderTick)) {
 			if (b.owner === this.ctx.selfId) continue;
 			this.drawShell(b);
 		}
@@ -467,16 +618,24 @@ class TankClientImpl implements TankClient {
 		}
 	}
 
-	private drawTanks(alpha: number): void {
-		const renderTick =
-			this.sim.tick - Math.max(1, Math.round(this.ctx.config.tickRate * 0.1)) + alpha;
+	/**
+	 * Remote tanks render from interpolated snapshot state (snapped across
+	 * respawns), the self tank from local prediction plus its correction
+	 * offset. While dead the wreck/ghost stays hidden — only the respawn
+	 * countdown shows — and an eliminated tank shows nothing at all.
+	 */
+	private drawTanks(renderTick: number): void {
 		for (const player of this.ctx.players) {
 			if (player.id === this.ctx.selfId) continue;
-			const sample = this.nearestSample(renderTick, player.id);
-			const pos = this.remoteTankPos(player.id, renderTick) ?? sample;
+			const pos =
+				this.buffer.tankAt(player.id, renderTick) ??
+				this.sim.tanks.find((t) => t.id === player.id) ??
+				null;
 			if (!pos) continue;
 			if (!pos.alive) {
-				this.drawRespawnLabel(pos.x, pos.y, pos.respawnTimer);
+				if (pos.lives > 0 && pos.respawnTimer > 0) {
+					this.drawRespawnLabel(pos.x, pos.y, pos.respawnTimer);
+				}
 				continue;
 			}
 			this.drawTank(pos, player.color);
@@ -484,8 +643,21 @@ class TankClientImpl implements TankClient {
 		const self = this.sim.tanks.find((t) => t.id === this.ctx.selfId);
 		const meta = this.playersById.get(this.ctx.selfId);
 		if (self && meta) {
-			if (!self.alive) this.drawRespawnLabel(self.x, self.y, self.respawnTimer);
-			else this.drawTank(self, meta.color);
+			if (!self.alive) {
+				if (self.lives > 0 && self.respawnTimer > 0) {
+					this.drawRespawnLabel(self.x, self.y, self.respawnTimer);
+				}
+				return;
+			}
+			this.drawTank(
+				{
+					...self,
+					x: self.x + this.selfOffset.x,
+					y: self.y + this.selfOffset.y,
+					angle: wrapAngle(self.angle + this.selfOffset.angle)
+				},
+				meta.color
+			);
 		}
 	}
 
@@ -493,6 +665,12 @@ class TankClientImpl implements TankClient {
 		const pixel = this.pixel;
 		// Invulnerability blink: skip every other stretch of frames.
 		if (tank.invulnTimer > 0 && Math.floor(this.animFrame / 3) % 2 === 0) return;
+		// Shield bubble (one shell hit pops it — see sim.hitTank).
+		if (tank.shield > 0) {
+			const pulse = (Math.floor(this.animFrame / 6) + 1) % 2 === 0 ? 1 : 0;
+			pixel.circle(tank.x, tank.y, TANK_HALF + 4 + pulse, 'rgba(110,198,255,0.55)', false);
+			pixel.fillRect(tank.x - TANK_HALF - 4, tank.y - TANK_HALF - 5, 3, 1, '#bfe9ff');
+		}
 		const ctx = pixel.ctx;
 		ctx.save();
 		ctx.translate(Math.round(tank.x), Math.round(tank.y));
@@ -516,17 +694,41 @@ class TankClientImpl implements TankClient {
 		pixel.fillRect(-3, -3, 6, 2, 'rgba(255,255,255,0.22)');
 		pixel.fillRect(1, -1, 9, 2, BARREL);
 		pixel.fillRect(9, -2, 3, 4, '#c9c9d6');
+		// Speed lines trail the hull while the `speed` boost drives it.
+		if (tank.speedTimer > 0 && tank.moveDir !== 0) {
+			pixel.fillRect(-12, -5, 4, 1, 'rgba(87,227,137,0.7)');
+			pixel.fillRect(-13, 4, 5, 1, 'rgba(87,227,137,0.7)');
+			pixel.fillRect(-11, -1, 3, 1, 'rgba(87,227,137,0.5)');
+		}
 		ctx.restore();
-		// Muzzle flash on the fire ticks.
-		const justFired = tank.reloadTimer >= reloadTicks(tank.level) - 3;
+		// Muzzle flash on the fire ticks — three-way while `triple` has shots.
+		const effectiveReload =
+			tank.rapidTimer > 0 ? rapidReloadTicks(tank.level) : reloadTicks(tank.level);
+		const justFired = tank.reloadTimer >= effectiveReload - 3;
 		if (justFired) {
-			const dx = Math.cos(tank.angle);
-			const dy = Math.sin(tank.angle);
-			const fx = tank.x + dx * (TANK_HALF + 7);
-			const fy = tank.y + dy * (TANK_HALF + 7);
-			pixel.fillRect(fx - 3, fy - 3, 6, 6, 'rgba(255,224,102,0.85)');
-			pixel.fillRect(fx - 1, fy - 5, 2, 10, 'rgba(255,159,67,0.8)');
-			pixel.fillRect(fx - 5, fy - 1, 10, 2, 'rgba(255,159,67,0.8)');
+			const angles =
+				tank.triple > 0
+					? [tank.angle - TRIPLE_SPREAD, tank.angle, tank.angle + TRIPLE_SPREAD]
+					: [tank.angle];
+			for (const angle of angles) {
+				const dx = Math.cos(angle);
+				const dy = Math.sin(angle);
+				const fx = tank.x + dx * (TANK_HALF + 7);
+				const fy = tank.y + dy * (TANK_HALF + 7);
+				pixel.fillRect(fx - 3, fy - 3, 6, 6, 'rgba(255,224,102,0.85)');
+				pixel.fillRect(fx - 1, fy - 5, 2, 10, 'rgba(255,159,67,0.8)');
+				pixel.fillRect(fx - 5, fy - 1, 10, 2, 'rgba(255,159,67,0.8)');
+			}
+			// Rapid-fire smoke: hot barrel, lots of shells.
+			if (tank.rapidTimer > 0) {
+				const dx = Math.cos(tank.angle);
+				const dy = Math.sin(tank.angle);
+				const jitter = (Math.floor(this.animFrame / 2) % 2) * 2;
+				const sx = tank.x + dx * (TANK_HALF + 9 + jitter);
+				const sy = tank.y + dy * (TANK_HALF + 9 + jitter);
+				pixel.fillRect(sx - 2, sy - 2, 4, 4, 'rgba(139,151,181,0.45)');
+				pixel.fillRect(sx - 4, sy - 4, 3, 3, 'rgba(139,151,181,0.3)');
+			}
 		}
 		if (tank.invulnTimer > 0) {
 			pixel.circle(tank.x, tank.y, TANK_HALF + 3, 'rgba(110,198,255,0.5)', false);
@@ -537,6 +739,70 @@ class TankClientImpl implements TankClient {
 		const seconds = Math.max(1, Math.ceil(respawnTimer / 60));
 		const label = `RESPAWNING ${seconds}`;
 		this.pixel.text(label, x - this.pixel.textWidth(label, 1) / 2, y - 20, TEXT_DIM, 1);
+	}
+
+	// ---- power-up pickups ----
+
+	/**
+	 * Glowing pickup icons (no crate sprite, so they never read as cover):
+	 * bubble = shield, 3 bullets = triple, lightning = rapid, arrows = speed.
+	 * Positions come from the snapshot clock like every other remote entity.
+	 */
+	private drawPowerups(renderTick: number): void {
+		const list =
+			this.buffer.length > 0 ? this.buffer.powerupsAt(renderTick) : [...this.sim.powerups];
+		for (const powerup of list) this.drawPowerup(powerup);
+	}
+
+	private drawPowerup(powerup: PowerupState): void {
+		const pixel = this.pixel;
+		const color = POWERUP_COLORS[powerup.kind];
+		const bob = Math.sin((this.animFrame + powerup.id * 24) * 0.08) * 1.5;
+		const x = powerup.x;
+		const y = powerup.y + bob;
+		// Pulsing glow ring (two-frame sparkle keeps the pixel-art feel).
+		const pulse = (Math.floor(this.animFrame / 10) + powerup.id) % 2;
+		pixel.circle(x, y, 9 + pulse, 'rgba(255,255,255,0.12)', true);
+		pixel.circle(x, y, 8, `${color}55`, false);
+		switch (powerup.kind) {
+			case 'shield':
+				// Bubble with a highlight crescent.
+				pixel.circle(x, y, 5, 'rgba(110,198,255,0.35)', true);
+				pixel.circle(x, y, 5, color, false);
+				pixel.fillRect(x - 3, y - 3, 2, 1, '#bfe9ff');
+				pixel.fillRect(x - 4, y - 2, 1, 2, '#bfe9ff');
+				break;
+			case 'triple': {
+				// Three shells fanned forward.
+				for (const [ox, oy] of [
+					[-5, 1],
+					[-1, -1],
+					[3, 1]
+				] as const) {
+					pixel.fillRect(x + ox - 1, y + oy - 1, 3, 3, BULLET_CORE);
+					pixel.fillRect(x + ox - 3, y + oy, 2, 1, BULLET_TRAIL);
+				}
+				break;
+			}
+			case 'rapid':
+				// Lightning bolt.
+				pixel.fillRect(x + 1, y - 6, 3, 4, color);
+				pixel.fillRect(x - 1, y - 2, 4, 2, color);
+				pixel.fillRect(x - 1, y, 3, 4, color);
+				pixel.fillRect(x - 3, y + 4, 3, 2, color);
+				break;
+			case 'speed':
+				// Three chevrons pointing right.
+				for (let i = 0; i < 3; i++) {
+					const cx = x - 6 + i * 4;
+					pixel.fillRect(cx, y - 3, 2, 1, color);
+					pixel.fillRect(cx + 1, y - 2, 2, 1, color);
+					pixel.fillRect(cx + 2, y - 1, 1, 2, color);
+					pixel.fillRect(cx + 1, y + 1, 2, 1, color);
+					pixel.fillRect(cx, y + 2, 2, 1, color);
+				}
+				break;
+		}
 	}
 
 	private drawEffects(): void {
@@ -622,7 +888,20 @@ class TankClientImpl implements TankClient {
 			pixel.fillRect(x + 40 + i * 7, y + 13, 5, 3, meta.color);
 			pixel.fillRect(x + 44 + i * 7, y + 14, 2, 1, meta.color);
 		}
-		if (!state.alive) pixel.text('OUT', x + 66, y + 13, '#ff5c7a', 1);
+		// Dead vs eliminated, straight from snapshot state.
+		if (!state.alive) pixel.text(state.lives > 0 ? 'DEAD' : 'OUT', x + 62, y + 13, '#ff5c7a', 1);
+		// Active effects: tiny icons + remaining-time bars.
+		const effects: Array<{ kind: PowerupKind; t: number }> = [];
+		if (state.shield > 0) effects.push({ kind: 'shield', t: 1 });
+		if (state.triple > 0) effects.push({ kind: 'triple', t: state.triple / TRIPLE_SHOTS });
+		if (state.rapidTimer > 0) effects.push({ kind: 'rapid', t: state.rapidTimer / EFFECT_TICKS });
+		if (state.speedTimer > 0) effects.push({ kind: 'speed', t: state.speedTimer / EFFECT_TICKS });
+		effects.slice(0, 4).forEach((effect, i) => {
+			const ex = x + 74 + i * 8;
+			this.drawEffectIcon(ex, y + 11, effect.kind);
+			pixel.fillRect(ex, y + 18, 5, 1, PANEL_EDGE);
+			pixel.fillRect(ex, y + 18, Math.max(1, Math.round(5 * effect.t)), 1, meta.color);
+		});
 	}
 
 	private drawStar(x: number, y: number, color: string): void {
@@ -630,6 +909,35 @@ class TankClientImpl implements TankClient {
 		pixel.fillRect(x + 1, y, 1, 1, color);
 		pixel.fillRect(x, y + 1, 3, 1, color);
 		pixel.fillRect(x + 1, y + 2, 1, 1, color);
+	}
+
+	/** 5x5 effect glyph for the HUD cards (same shapes as the map pickups). */
+	private drawEffectIcon(x: number, y: number, kind: PowerupKind): void {
+		const pixel = this.pixel;
+		const color = POWERUP_COLORS[kind];
+		switch (kind) {
+			case 'shield':
+				pixel.fillRect(x + 1, y, 3, 1, color);
+				pixel.fillRect(x, y + 1, 5, 2, color);
+				pixel.fillRect(x + 1, y + 3, 3, 1, color);
+				pixel.fillRect(x + 2, y + 4, 1, 1, color);
+				break;
+			case 'triple':
+				for (let i = 0; i < 3; i++) pixel.fillRect(x + i * 2, y + 1, 1, 3, color);
+				break;
+			case 'rapid':
+				pixel.fillRect(x + 2, y, 2, 2, color);
+				pixel.fillRect(x + 1, y + 2, 2, 1, color);
+				pixel.fillRect(x + 1, y + 3, 2, 2, color);
+				break;
+			case 'speed':
+				pixel.fillRect(x, y, 3, 1, color);
+				pixel.fillRect(x + 1, y + 1, 2, 1, color);
+				pixel.fillRect(x + 2, y + 2, 1, 1, color);
+				pixel.fillRect(x + 1, y + 3, 2, 1, color);
+				pixel.fillRect(x, y + 4, 3, 1, color);
+				break;
+		}
 	}
 
 	private drawLocalOverlay(): void {
@@ -653,71 +961,7 @@ class TankClientImpl implements TankClient {
 		}
 	}
 
-	// ---- snapshot interpolation (~100ms buffer) ----
-
-	private nearestSample(atTick: number, id: PlayerId): TankState | null {
-		const buf = this.remoteSamples;
-		if (buf.length === 0) return null;
-		let best: RemoteSample | null = null;
-		for (const sample of buf) {
-			if (sample.tick <= atTick) best = sample;
-			else break;
-		}
-		const use = best ?? buf[0];
-		return use.tanks.get(id) ?? null;
-	}
-
-	private remoteTankPos(id: PlayerId, atTick: number): TankState | null {
-		const buf = this.remoteSamples;
-		if (buf.length === 0) {
-			return this.sim.tanks.find((t) => t.id === id) ?? null;
-		}
-		const { prev, next } = this.samplePair(atTick);
-		const a = prev?.tanks.get(id) ?? null;
-		const b = next?.tanks.get(id) ?? null;
-		if (!prev || !next || !a || !b) return a ?? b;
-		const span = next.tick - prev.tick;
-		const t = span > 0 ? (atTick - prev.tick) / span : 1;
-		return {
-			...a,
-			x: a.x + (b.x - a.x) * t,
-			y: a.y + (b.y - a.y) * t,
-			angle: a.angle + (b.angle - a.angle) * t
-		};
-	}
-
-	private remoteBullets(atTick: number): BulletState[] {
-		const buf = this.remoteSamples;
-		if (buf.length === 0) return [];
-		const { prev, next } = this.samplePair(atTick);
-		if (!prev) return next ? [...next.bullets.values()] : [];
-		if (!next) return [...prev.bullets.values()];
-		const span = next.tick - prev.tick;
-		const t = span > 0 ? (atTick - prev.tick) / span : 1;
-		const out: BulletState[] = [];
-		for (const [id, a] of prev.bullets) {
-			const b = next.bullets.get(id);
-			out.push(b ? { ...a, x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t } : a);
-		}
-		for (const [id, b] of next.bullets) {
-			if (!prev.bullets.has(id)) out.push(b);
-		}
-		return out;
-	}
-
-	private samplePair(atTick: number): { prev: RemoteSample | null; next: RemoteSample | null } {
-		const buf = this.remoteSamples;
-		let prev: RemoteSample | null = null;
-		let next: RemoteSample | null = null;
-		for (const sample of buf) {
-			if (sample.tick <= atTick) prev = sample;
-			else {
-				next = sample;
-				break;
-			}
-		}
-		return { prev, next };
-	}
+	// ---- snapshot interpolation lives in `interp.ts` (RemoteBuffer) ----
 }
 
 export function createTankClient(ctx: GameContext): TankClient {
